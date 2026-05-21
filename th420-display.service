@@ -1,0 +1,11 @@
+[Unit]
+Description=Thermaltake TH420 V2 LCD display driver
+After=systemd-udevd.service
+
+[Service]
+ExecStart=%h/.local/bin/th420-display
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

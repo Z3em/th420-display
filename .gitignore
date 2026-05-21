@@ -1,0 +1,5 @@
+/target/
+/CLAUDE.md
+/.claude/
+/.idea/
+*.AppImage

@@ -1,0 +1,2 @@
+# Thermaltake TH420 V2 LCD display — allow access without sudo
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="264a", ATTRS{idProduct}=="233c", MODE="0660", TAG+="uaccess"

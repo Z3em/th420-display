@@ -1,0 +1,37 @@
+[package]
+name = "th420-display"
+version = "0.2.0"
+edition = "2021"
+description = "Linux driver for Thermaltake TH420 V2 Ultra EX LCD display"
+license = "MIT"
+repository = "https://github.com/messiahlap/th420-display"
+
+[[bin]]
+name = "th420-display"
+path = "src/main.rs"
+
+[[bin]]
+name = "th420-config"
+path = "src/gui.rs"
+required-features = ["gui"]
+
+[features]
+gui = ["dep:eframe", "dep:egui", "dep:rfd"]
+
+[dependencies]
+image = "0.25"
+imageproc = "0.25"
+ab_glyph = "0.2"
+clap = { version = "4", features = ["derive"] }
+libc = "0.2"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+dirs = "5"
+nvml-wrapper = "0.12"
+nvml-wrapper-sys = "0.9"
+
+# GUI deps (optional)
+eframe = { version = "0.31", optional = true }
+egui = { version = "0.31", optional = true }
+rfd = { version = "0.15", optional = true }
