@@ -213,7 +213,8 @@ Two HID interfaces detected by packet size:
 
 **Frame:** JPEG split into 1020-byte chunks, each prefixed with `[0x08, idx, 0x00, 0x80/0x00]`.  
 **Keep-alive:** frame re-sent every ~800 ms.  
-**Coolant temp:** write `0x80 0x01 0x00 0x80` to ctrl; bytes [6:7] = big-endian u16 / 1000.0 °C.
+**Coolant temp:** write `0x80 0x01 0x00 0x80` to ctrl; response bytes 4--5 are
+redundant integer encodings: `byte[4] - 0x24` gives °C.
 
 ---
 

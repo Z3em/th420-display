@@ -295,6 +295,11 @@ fn main() -> Result<()> {
 
     let mut dev = device::Device::open()?;
     dev.init()?;
+    // Brightness is persistent on the device.  Set it once before the live
+    // stream so the control endpoint is reserved for the coolant query below.
+    // Re-sending brightness for every frame can leave an ACK queued, which
+    // would then be mistaken for a temperature response on the next tick.
+    dev.set_brightness(100)?;
     println!("Device ready. Displaying stats (Ctrl+C to stop).");
 
     let mut sensors = sensors::SensorReader::new();
@@ -320,7 +325,7 @@ fn main() -> Result<()> {
         );
 
         let jpeg = renderer.render(&cfg, &values);
-        dev.send_frame(&jpeg)?;
+        dev.send_frame_data(&jpeg)?;
 
         let elapsed = tick.elapsed();
         if elapsed < interval {

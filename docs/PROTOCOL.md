@@ -39,8 +39,16 @@ the same sequence when attaching. Response semantics are not decoded, but a
 response is read and drained after each command; skipping those reads is
 untested.
 
-Coolant query: `80 01 00 80`. Response bytes 6--7 are a big-endian unsigned
-millidegrees-C value; divide by `1000.0`.
+Coolant query: `80 01 00 80`. The response encodes the integer coolant
+temperature redundantly: bytes 4--5 are `temperature + 0x24` and
+`temperature + 0x25`. For example, the observed prefix
+`80 01 00 80 3e 3f 09 10` reports `26 °C` (`0x3e - 0x24`); bytes 6--7 are
+instead the pump speed (`0x0910` = 2320 RPM).
+
+Hardware-verified on 2026-09-14: a direct `hidraw` query returned that prefix
+while the device's independent standby overlay showed `Liquid 26 °C`. The
+paired bytes must be checked before accepting a reading; behaviour at other
+temperatures is still inferred from this validated sample.
 
 ## Live display streaming
 
@@ -50,10 +58,10 @@ vendor live stream ran at about 21.5 fps (median inter-frame spacing 47.7 ms),
 and the project was visually verified at 24 fps. Neither observation is known
 to be a firmware maximum.
 
-1. Write `12 01 00 80 brightness` on the control interface. The legacy
-   `Device::send_frame()` writes `64` hex (100 decimal) before every frame.
-   Continuous playback sets brightness once and then sends image data directly
-   so a control read does not limit the frame rate.
+1. Write `12 01 00 80 brightness` on the control interface. Brightness is
+   persistent, so the monitor daemon and continuous playback set it once and
+   then send image data directly. This also prevents a brightness ACK from
+   being consumed as the next coolant-query response.
 2. Split the JPEG into 1020-byte pieces and write a 1024-byte report per piece
    on the image interface:
 

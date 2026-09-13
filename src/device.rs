@@ -92,25 +92,11 @@ impl Device {
         Ok(())
     }
 
-    /// Query device for liquid coolant temperature (bytes 6-7 big-endian, millidegrees)
+    /// Query device for liquid coolant temperature.
     pub fn read_liquid_temp(&mut self) -> io::Result<f32> {
         self.ctrl_write(&[0x80, 0x01, 0x00, 0x80])?;
         let resp = self.ctrl_read()?;
-        let millideg = u16::from_be_bytes([resp[6], resp[7]]) as f32;
-        Ok(millideg / 1000.0)
-    }
-
-    pub fn send_frame(&mut self, jpeg: &[u8]) -> io::Result<()> {
-        self.send_frame_with_brightness(jpeg, 100)
-    }
-
-    /// Stream one transient JPEG frame at a specified LCD brightness.
-    pub fn send_frame_with_brightness(&mut self, jpeg: &[u8], brightness: u8) -> io::Result<()> {
-        self.set_brightness(brightness)?;
-        // device may or may not ACK the frame-start command
-        let _ = self.ctrl_read();
-
-        self.send_frame_data(jpeg)
+        parse_liquid_temp(&resp)
     }
 
     /// Stream JPEG data without writing a control-interface brightness value.
@@ -271,6 +257,20 @@ impl Device {
     }
 }
 
+fn parse_liquid_temp(resp: &[u8; CTRL_SIZE]) -> io::Result<f32> {
+    // The status response starts `80 01 00 80 temp+0x24 temp+0x25 ...`.
+    // The adjacent encoding acts as a small integrity check. Bytes 6-7 are
+    // instead pump RPM (e.g. 09 10 = 2320 RPM).
+    let encoded = resp[4];
+    if encoded < 0x24 || resp[5] != encoded.saturating_add(1) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid liquid-temperature response",
+        ));
+    }
+    Ok((encoded - 0x24) as f32)
+}
+
 /// Build the verified `Update_Boot_GIF` container from encoded JPEG frames.
 pub fn build_boot_container(frames: &[Vec<u8>]) -> io::Result<Vec<u8>> {
     if frames.is_empty() {
@@ -379,6 +379,16 @@ mod tests {
         ));
         let file = OpenOptions::new().read(true).write(true).create_new(true).open(&path).unwrap();
         (path, file)
+    }
+
+    #[test]
+    fn coolant_temperature_uses_encoded_status_field() {
+        let mut response = [0u8; CTRL_SIZE];
+        response[..8].copy_from_slice(&[0x80, 0x01, 0x00, 0x80, 0x3e, 0x3f, 0x09, 0x10]);
+
+        assert_eq!(parse_liquid_temp(&response).unwrap(), 26.0);
+        response[5] = 0;
+        assert!(parse_liquid_temp(&response).is_err());
     }
 
     #[test]
