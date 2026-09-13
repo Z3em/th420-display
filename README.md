@@ -162,6 +162,42 @@ immediately — no manual save step needed.
 
 ---
 
+## Persistent LCD media
+
+The `th420-display` CLI can also configure the LCD's persistent media and
+standby controls. These commands write device flash; do not combine them with
+the normal monitoring daemon.
+
+```bash
+# Store a 480x480 standby picture (input images are resized automatically)
+th420-display --upload-standby picture.png
+
+# Upload a standby picture while committing pump-temperature text colour and brightness
+th420-display --upload-standby picture.png \
+  --pump-temp-color '#0000ff' --standby-brightness 80
+
+# Set persistent screen brightness without replacing the standby picture
+th420-display --standby-brightness 60
+
+# Store a boot animation from an animated GIF
+th420-display --upload-boot animation.gif
+
+# Play one or more transient live frames, or a GIF using its own timing
+th420-display --play-live-frames frame-01.png frame-02.png --live-fps 24
+th420-display --play-live-gif animation.gif
+```
+
+Standby input is converted to a 480x480 JPEG. Boot GIF frames are resized to
+480x480 and encoded into the device's persistent boot format. Boot GIFs must
+have one uniform, integral frame delay of at least 80 ms; the project also
+enforces a conservative 5 MiB container limit. The boot and standby uploads,
+including persistence across a physical reconnect, have been verified on
+hardware.
+
+For the full command reference, run `th420-display --help`.
+
+---
+
 ## Device protocol
 
 For the full capture-based reverse-engineering reference, including persistent
@@ -191,18 +227,41 @@ systemctl --user daemon-reload
 systemctl --user enable --now th420-display
 ```
 
+### runit (Void Linux)
+
+The repository also includes a system runit service. It defaults to the
+packaged binary at `/usr/bin/th420-display`. Install it and enable it with:
+
+```bash
+sudo install -Dm755 runit/th420-display/run /etc/sv/th420-display/run
+sudo install -Dm644 runit/th420-display/conf.example /etc/sv/th420-display/conf
+sudo ln -s /etc/sv/th420-display /var/service/th420-display
+```
+
+Because runit services are system services, the daemon otherwise uses root's
+default configuration path. Edit `/etc/sv/th420-display/conf` to set
+`TH420_DISPLAY_CONFIG` to the configuration file that should drive the display,
+or `TH420_DISPLAY_BIN` for a non-packaged binary. Remove the `/var/service/`
+symlink to stop and disable the service.
+
 ---
 
 ## Development
 
 ```bash
-cargo test                   # unit tests (no hardware)
-cargo test --features gui    # all 46 tests including headless GUI tests
+cargo test                   # 59 daemon unit tests; no hardware required
+cargo test --features gui    # daemon suite plus 15 headless GUI tests (74 distinct tests)
 ```
+
+The hermetic suite covers configuration migration and layouts, rendering,
+sensor-data parsing, media encoding, CLI validation, and device packet
+framing. It does not replace hardware integration testing: HID discovery and
+transport acknowledgements, NVML/system sensor discovery, and interactive GUI
+flows still require a compatible running system and physical device.
 
 ---
 
 ## Notes
 
 - **Personal project** — built for personal use on a specific hardware setup. No ongoing support, issue tracking, or compatibility guarantees are planned.
-- **Co-authored with [Claude](https://claude.ai)** (Anthropic) — protocol reverse-engineering, driver implementation, GUI, and tooling developed in pair-programming sessions with Claude Code.
+- **Developed with [Claude](https://claude.ai) and [ChatGPT](https://chatgpt.com/)** — protocol reverse-engineering, driver implementation, GUI, and tooling were developed in assisted pair-programming sessions.

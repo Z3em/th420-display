@@ -326,8 +326,12 @@ fn read_u64(path: &str) -> Option<u64> {
 
 fn read_proc_stat() -> Option<(u64, u64)> {
     let content = fs::read_to_string("/proc/stat").ok()?;
-    let line = content.lines().next()?;
-    let mut p = line.split_whitespace().skip(1);
+    parse_proc_stat(&content)
+}
+
+fn parse_proc_stat(content: &str) -> Option<(u64, u64)> {
+    let line = content.lines().next()?.strip_prefix("cpu ")?;
+    let mut p = line.split_whitespace();
     let user:    u64 = p.next()?.parse().ok()?;
     let nice:    u64 = p.next()?.parse().ok()?;
     let system:  u64 = p.next()?.parse().ok()?;
@@ -357,6 +361,10 @@ fn read_cpu_freq_avg() -> f32 {
 
 fn read_ram_used_pct() -> Option<f32> {
     let content = fs::read_to_string("/proc/meminfo").ok()?;
+    parse_ram_used_pct(&content)
+}
+
+fn parse_ram_used_pct(content: &str) -> Option<f32> {
     let mut total_kb = 0u64;
     let mut avail_kb = 0u64;
     for line in content.lines() {
@@ -368,4 +376,49 @@ fn read_ram_used_pct() -> Option<f32> {
     }
     if total_kb == 0 { return None; }
     Some(total_kb.saturating_sub(avail_kb) as f32 / total_kb as f32 * 100.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_proc_stat_and_counts_iowait_as_idle() {
+        let (idle, total) = parse_proc_stat("cpu  100 20 30 400 50 10 20 0 0 0\n")
+            .expect("valid proc stat");
+        assert_eq!(idle, 450);
+        assert_eq!(total, 630);
+    }
+
+    #[test]
+    fn rejects_malformed_proc_stat() {
+        assert!(parse_proc_stat("cpu  1 2 3\n").is_none());
+        assert!(parse_proc_stat("intr 1 2 3\n").is_none());
+    }
+
+    #[test]
+    fn parses_ram_used_percentage_and_handles_missing_total() {
+        let pct = parse_ram_used_pct("MemTotal:       1000 kB\nMemAvailable:    250 kB\n")
+            .expect("valid meminfo");
+        assert!((pct - 75.0).abs() < f32::EPSILON);
+        assert!(parse_ram_used_pct("MemAvailable: 250 kB\n").is_none());
+    }
+
+    #[test]
+    fn probe_and_numeric_readers_handle_valid_and_invalid_files() {
+        let root = std::env::temp_dir().join(format!("th420-sensors-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let input = root.join("temp1_input");
+        fs::write(&input, "42500\n").unwrap();
+
+        assert_eq!(probe(&root, "temp1_input"), Some(input.to_string_lossy().into_owned()));
+        assert_eq!(read_u64(input.to_str().unwrap()), Some(42_500));
+        assert_eq!(read_millidegree(input.to_str().unwrap()), Some(42));
+        fs::write(&input, "not-a-number").unwrap();
+        assert_eq!(read_u64(input.to_str().unwrap()), None);
+        assert_eq!(probe(&root, "missing"), None);
+
+        fs::remove_dir_all(root).unwrap();
+    }
 }

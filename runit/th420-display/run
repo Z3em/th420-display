@@ -1,0 +1,24 @@
+#!/bin/sh
+# runit service for the TH420 display daemon.
+#
+# Optional local settings live in a sibling `conf` file.  This keeps the
+# tracked service generic while allowing a system administrator to select a
+# non-packaged binary or a particular user's configuration file.
+
+exec 2>&1
+
+service_dir=${0%/*}
+[ "$service_dir" = "$0" ] && service_dir=.
+
+if [ -r "$service_dir/conf" ]; then
+    # shellcheck source=/dev/null
+    . "$service_dir/conf"
+fi
+
+: "${TH420_DISPLAY_BIN:=/usr/bin/th420-display}"
+
+if [ -n "${TH420_DISPLAY_CONFIG:-}" ]; then
+    exec "$TH420_DISPLAY_BIN" --config "$TH420_DISPLAY_CONFIG"
+fi
+
+exec "$TH420_DISPLAY_BIN"

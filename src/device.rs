@@ -369,7 +369,17 @@ fn poll_read(file: &File, timeout_ms: i32) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::build_boot_container;
+    use super::*;
+    use std::io::{Read, Seek, SeekFrom};
+
+    fn temp_file(name: &str) -> (std::path::PathBuf, File) {
+        let path = std::env::temp_dir().join(format!(
+            "th420-device-{name}-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let file = OpenOptions::new().read(true).write(true).create_new(true).open(&path).unwrap();
+        (path, file)
+    }
 
     #[test]
     fn boot_container_has_verified_offsets_and_checksum() {
@@ -389,5 +399,53 @@ mod tests {
         assert_eq!(&container[76..87], b"001.jpg\0\x05\x06\x07");
         assert_eq!(&container[87..102], &[0; 15]);
         assert_eq!(container[102], 0x10);
+    }
+
+    #[test]
+    fn boot_container_rejects_empty_frames_and_too_many_frames() {
+        assert!(build_boot_container(&[]).is_err());
+        assert!(build_boot_container(&[vec![]]).is_err());
+        assert!(build_boot_container(&vec![vec![1]; 256]).is_err());
+    }
+
+    #[test]
+    fn frame_data_is_split_into_protocol_packets() {
+        let (ctrl_path, ctrl) = temp_file("ctrl");
+        let (image_path, image) = temp_file("image");
+        let mut device = Device { ctrl, image };
+        let jpeg = vec![0x5a; IMG_DATA_SIZE + 3];
+        device.send_frame_data(&jpeg).unwrap();
+
+        let mut image = File::open(&image_path).unwrap();
+        let mut bytes = Vec::new();
+        image.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes.len(), IMG_PKT_SIZE * 2);
+        assert_eq!(&bytes[..4], &[0x08, 2, 0, 0x80]);
+        assert_eq!(&bytes[4..4 + IMG_DATA_SIZE], &jpeg[..IMG_DATA_SIZE]);
+        assert_eq!(&bytes[IMG_PKT_SIZE..IMG_PKT_SIZE + 4], &[0x08, 1, 0, 0]);
+        assert_eq!(&bytes[IMG_PKT_SIZE + 4..IMG_PKT_SIZE + 7], &jpeg[IMG_DATA_SIZE..]);
+
+        drop(device);
+        fs::remove_file(ctrl_path).unwrap();
+        fs::remove_file(image_path).unwrap();
+    }
+
+    #[test]
+    fn brightness_validates_range_and_writes_padded_command() {
+        let (ctrl_path, ctrl) = temp_file("brightness-ctrl");
+        let (image_path, image) = temp_file("brightness-image");
+        let mut device = Device { ctrl, image };
+        assert!(device.set_brightness(101).is_err());
+        device.set_brightness(42).unwrap();
+
+        device.ctrl.seek(SeekFrom::Start(0)).unwrap();
+        let mut command = [0; CTRL_SIZE];
+        device.ctrl.read_exact(&mut command).unwrap();
+        assert_eq!(&command[..5], &[0x12, 0x01, 0, 0x80, 42]);
+        assert!(command[5..].iter().all(|&b| b == 0));
+
+        drop(device);
+        fs::remove_file(ctrl_path).unwrap();
+        fs::remove_file(image_path).unwrap();
     }
 }

@@ -145,11 +145,7 @@ fn decode_boot_gif(path: &Path) -> Result<(Vec<Vec<u8>>, u32)> {
     Ok((frames, frame_delay_ms.ok_or_else(|| anyhow::anyhow!("boot GIF has no frames"))?))
 }
 
-fn main() -> Result<()> {
-    let cli = Cli::parse();
-    let interval = Duration::from_millis(cli.interval);
-    let config_path = cli.config.unwrap_or_else(default_config_path);
-
+fn validate_cli(cli: &Cli) -> Result<()> {
     if cli.pump_temp_color.is_some() && cli.upload_standby.is_none() {
         bail!("--pump-temp-color requires --upload-standby to commit the color");
     }
@@ -172,6 +168,14 @@ fn main() -> Result<()> {
     {
         bail!("live playback cannot be combined with persistent settings");
     }
+    Ok(())
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    validate_cli(&cli)?;
+    let interval = Duration::from_millis(cli.interval);
+    let config_path = cli.config.unwrap_or_else(default_config_path);
 
     if let Some(path) = cli.upload_boot {
         let (frames, frame_delay_ms) = decode_boot_gif(&path)?;
@@ -327,7 +331,15 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_rgb;
+    use super::*;
+
+    fn cli() -> Cli {
+        Cli {
+            interval: 800, config: None, upload_standby: None, standby_brightness: None,
+            pump_temp_color: None, upload_boot: None, play_live_frames: vec![],
+            play_live_gif: None, live_fps: 24, live_loops: 1, live_brightness: 80,
+        }
+    }
 
     #[test]
     fn parses_rgb_with_or_without_hash() {
@@ -339,5 +351,40 @@ mod tests {
     fn rejects_invalid_rgb() {
         assert!(parse_rgb("#0f0").is_err());
         assert!(parse_rgb("#00ff0z").is_err());
+    }
+
+    #[test]
+    fn jpeg_encoders_produce_decodable_480_square_images() {
+        let source = image::RgbImage::from_pixel(16, 8, image::Rgb([20, 40, 60]));
+        for encoded in [encode_rgb_jpeg(source.clone()), encode_boot_jpeg(source)] {
+            let decoded = image::load_from_memory(&encoded.unwrap()).unwrap();
+            assert_eq!((decoded.width(), decoded.height()), (480, 480));
+        }
+    }
+
+    #[test]
+    fn cli_validation_rejects_conflicting_operations() {
+        let mut options = cli();
+        options.pump_temp_color = Some("#ffffff".into());
+        assert!(validate_cli(&options).is_err());
+
+        let mut options = cli();
+        options.upload_boot = Some("boot.gif".into());
+        options.upload_standby = Some("standby.png".into());
+        assert!(validate_cli(&options).is_err());
+
+        let mut options = cli();
+        options.play_live_frames.push("one.png".into());
+        options.play_live_gif = Some("live.gif".into());
+        assert!(validate_cli(&options).is_err());
+    }
+
+    #[test]
+    fn cli_validation_accepts_one_operation_at_a_time() {
+        let mut options = cli();
+        options.upload_standby = Some("standby.png".into());
+        options.pump_temp_color = Some("#0055ff".into());
+        options.standby_brightness = Some(80);
+        assert!(validate_cli(&options).is_ok());
     }
 }

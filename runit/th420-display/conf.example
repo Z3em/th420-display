@@ -1,0 +1,5 @@
+# Optional runit service configuration.  Copy this file to `conf` next to
+# `run`, then uncomment and adjust values as needed.
+
+# TH420_DISPLAY_BIN=/usr/local/bin/th420-display
+# TH420_DISPLAY_CONFIG=/home/your-user/.config/th420-display/config.toml
