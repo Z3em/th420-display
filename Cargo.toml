@@ -21,6 +21,7 @@ gui = ["dep:eframe", "dep:egui", "dep:rfd"]
 [dependencies]
 image = "0.25"
 imageproc = "0.25"
+jpeg-encoder = "0.6"
 ab_glyph = "0.2"
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"

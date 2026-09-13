@@ -164,6 +164,10 @@ immediately — no manual save step needed.
 
 ## Device protocol
 
+For the full capture-based reverse-engineering reference, including persistent
+standby media, overlay settings, brightness, live JPEG streaming, and the
+hardware-tested boot-animation format, see [docs/PROTOCOL.md](docs/PROTOCOL.md).
+
 Two HID interfaces detected by packet size:
 
 | Interface | Packet | Role |
