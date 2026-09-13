@@ -5,20 +5,23 @@ mod sensors;
 
 use anyhow::{bail, Result};
 use clap::Parser;
-use config::{Config, default_config_path};
-use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime};
-use std::io::Cursor;
-use image::{AnimationDecoder, imageops};
+use config::{default_config_path, Config};
 use image::codecs::gif::GifDecoder;
+use image::{imageops, AnimationDecoder};
 use jpeg_encoder::{ColorType as JpegColorType, Encoder as JpegEncoder, SamplingFactor};
 use std::fs::File;
 use std::io::BufReader;
+use std::io::Cursor;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime};
 
 const MAX_BOOT_CONTAINER_SIZE: usize = 5 * 1024 * 1024;
 
 #[derive(Parser)]
-#[command(name = "th420-display", about = "CPU/GPU monitor for Thermaltake TH420 V2 LCD")]
+#[command(
+    name = "th420-display",
+    about = "CPU/GPU monitor for Thermaltake TH420 V2 LCD"
+)]
 struct Cli {
     /// Update interval in milliseconds
     #[arg(short, long, default_value = "800")]
@@ -27,6 +30,10 @@ struct Cli {
     /// Path to config file
     #[arg(short, long)]
     config: Option<PathBuf>,
+
+    /// Print device coolant temperature and pump RPM, then exit.
+    #[arg(long)]
+    status: bool,
 
     /// Upload one image as the persistent standby picture, then exit.
     #[arg(long, value_name = "IMAGE")]
@@ -95,16 +102,21 @@ fn encode_rgb_jpeg(source: image::RgbImage) -> Result<Vec<u8>> {
 
 fn decode_gif(path: &Path) -> Result<Vec<(Vec<u8>, Duration)>> {
     let decoder = GifDecoder::new(BufReader::new(File::open(path)?))?;
-    decoder.into_frames().collect_frames()?.into_iter().map(|frame| {
-        let (numerator, denominator) = frame.delay().numer_denom_ms();
-        let delay = if denominator == 0 {
-            Duration::from_millis(100)
-        } else {
-            Duration::from_secs_f64(f64::from(numerator) / f64::from(denominator) / 1000.0)
-        };
-        let rgb = image::DynamicImage::ImageRgba8(frame.into_buffer()).into_rgb8();
-        Ok((encode_rgb_jpeg(rgb)?, delay))
-    }).collect()
+    decoder
+        .into_frames()
+        .collect_frames()?
+        .into_iter()
+        .map(|frame| {
+            let (numerator, denominator) = frame.delay().numer_denom_ms();
+            let delay = if denominator == 0 {
+                Duration::from_millis(100)
+            } else {
+                Duration::from_secs_f64(f64::from(numerator) / f64::from(denominator) / 1000.0)
+            };
+            let rgb = image::DynamicImage::ImageRgba8(frame.into_buffer()).into_rgb8();
+            Ok((encode_rgb_jpeg(rgb)?, delay))
+        })
+        .collect()
 }
 
 fn encode_boot_jpeg(source: image::RgbImage) -> Result<Vec<u8>> {
@@ -142,12 +154,25 @@ fn decode_boot_gif(path: &Path) -> Result<(Vec<Vec<u8>>, u32)> {
         frames.push(encode_boot_jpeg(rgb)?);
     }
 
-    Ok((frames, frame_delay_ms.ok_or_else(|| anyhow::anyhow!("boot GIF has no frames"))?))
+    Ok((
+        frames,
+        frame_delay_ms.ok_or_else(|| anyhow::anyhow!("boot GIF has no frames"))?,
+    ))
 }
 
 fn validate_cli(cli: &Cli) -> Result<()> {
     if cli.pump_temp_color.is_some() && cli.upload_standby.is_none() {
         bail!("--pump-temp-color requires --upload-standby to commit the color");
+    }
+    if cli.status
+        && (cli.upload_standby.is_some()
+            || cli.standby_brightness.is_some()
+            || cli.pump_temp_color.is_some()
+            || cli.upload_boot.is_some()
+            || !cli.play_live_frames.is_empty()
+            || cli.play_live_gif.is_some())
+    {
+        bail!("--status cannot be combined with display operations");
     }
     if cli.upload_boot.is_some()
         && (cli.upload_standby.is_some()
@@ -177,6 +202,16 @@ fn main() -> Result<()> {
     let interval = Duration::from_millis(cli.interval);
     let config_path = cli.config.unwrap_or_else(default_config_path);
 
+    if cli.status {
+        let mut dev = device::Device::open()?;
+        dev.init()?;
+        let status = dev.read_status()?;
+        // Stable machine-readable output used by the GUI and useful in scripts.
+        println!("coolant_temp_c={:.1}", status.coolant_temp_c);
+        println!("pump_rpm={}", status.pump_rpm);
+        return Ok(());
+    }
+
     if let Some(path) = cli.upload_boot {
         let (frames, frame_delay_ms) = decode_boot_gif(&path)?;
         let container = device::build_boot_container(&frames)?;
@@ -189,7 +224,9 @@ fn main() -> Result<()> {
         dev.init()?;
         println!(
             "Uploading boot animation: {} frame(s), {} ms/frame, {} bytes.",
-            frames.len(), frame_delay_ms, container.len(),
+            frames.len(),
+            frame_delay_ms,
+            container.len(),
         );
         dev.upload_boot(&container, frame_delay_ms)?;
         println!("Boot animation upload complete.");
@@ -207,10 +244,13 @@ fn main() -> Result<()> {
         dev.init()?;
         println!(
             "Streaming {} GIF frame(s) for {} loop(s) at {}% brightness.",
-            frames.len(), cli.live_loops, cli.live_brightness,
+            frames.len(),
+            cli.live_loops,
+            cli.live_brightness,
         );
         dev.set_brightness(cli.live_brightness)?;
-        for _ in 0..cli.live_loops {
+        let mut completed = 0usize;
+        while cli.live_loops == 0 || completed < cli.live_loops {
             for (frame, delay) in &frames {
                 let tick = Instant::now();
                 dev.send_frame_data(frame)?;
@@ -219,12 +259,15 @@ fn main() -> Result<()> {
                     std::thread::sleep(*delay - elapsed);
                 }
             }
+            completed = completed.saturating_add(1);
         }
         return Ok(());
     }
 
     if !cli.play_live_frames.is_empty() {
-        let frames: Result<Vec<_>> = cli.play_live_frames.iter()
+        let frames: Result<Vec<_>> = cli
+            .play_live_frames
+            .iter()
             .map(|path| encode_jpeg(path))
             .collect();
         let frames = frames?;
@@ -235,10 +278,14 @@ fn main() -> Result<()> {
         dev.init()?;
         println!(
             "Streaming {} frame(s) at {} FPS for {} loop(s) at {}% brightness.",
-            frames.len(), cli.live_fps, cli.live_loops, cli.live_brightness,
+            frames.len(),
+            cli.live_fps,
+            cli.live_loops,
+            cli.live_brightness,
         );
         dev.set_brightness(cli.live_brightness)?;
-        for _ in 0..cli.live_loops {
+        let mut completed = 0usize;
+        while cli.live_loops == 0 || completed < cli.live_loops {
             for frame in &frames {
                 let tick = Instant::now();
                 dev.send_frame_data(frame)?;
@@ -247,6 +294,7 @@ fn main() -> Result<()> {
                     std::thread::sleep(period - elapsed);
                 }
             }
+            completed = completed.saturating_add(1);
         }
         return Ok(());
     }
@@ -269,10 +317,17 @@ fn main() -> Result<()> {
         // upload; preserve that ordering so the upload commits the staged color.
         if let Some(color) = color {
             dev.set_pump_temperature_color(color)?;
-            println!("Pump-temperature text color set to #{:02x}{:02x}{:02x}.", color[0], color[1], color[2]);
+            println!(
+                "Pump-temperature text color set to #{:02x}{:02x}{:02x}.",
+                color[0], color[1], color[2]
+            );
         }
         if let Some((path, encoded)) = encoded {
-            println!("Uploading standby image: {} ({} bytes)", path.display(), encoded.len());
+            println!(
+                "Uploading standby image: {} ({} bytes)",
+                path.display(),
+                encoded.len()
+            );
             dev.upload_standby(&encoded)?;
             println!("Standby image upload complete.");
         }
@@ -319,10 +374,9 @@ fn main() -> Result<()> {
         }
 
         let mut values = sensors.read();
-        values.readings.insert(
-            "coolant".to_string(),
-            dev.read_liquid_temp().unwrap_or(0.0),
-        );
+        values
+            .readings
+            .insert("coolant".to_string(), dev.read_liquid_temp().unwrap_or(0.0));
 
         let jpeg = renderer.render(&cfg, &values);
         dev.send_frame_data(&jpeg)?;
@@ -340,9 +394,18 @@ mod tests {
 
     fn cli() -> Cli {
         Cli {
-            interval: 800, config: None, upload_standby: None, standby_brightness: None,
-            pump_temp_color: None, upload_boot: None, play_live_frames: vec![],
-            play_live_gif: None, live_fps: 24, live_loops: 1, live_brightness: 80,
+            interval: 800,
+            config: None,
+            status: false,
+            upload_standby: None,
+            standby_brightness: None,
+            pump_temp_color: None,
+            upload_boot: None,
+            play_live_frames: vec![],
+            play_live_gif: None,
+            live_fps: 24,
+            live_loops: 1,
+            live_brightness: 80,
         }
     }
 
@@ -391,5 +454,13 @@ mod tests {
         options.pump_temp_color = Some("#0055ff".into());
         options.standby_brightness = Some(80);
         assert!(validate_cli(&options).is_ok());
+    }
+
+    #[test]
+    fn status_is_exclusive_with_display_operations() {
+        let mut options = cli();
+        options.status = true;
+        options.upload_standby = Some("standby.png".into());
+        assert!(validate_cli(&options).is_err());
     }
 }

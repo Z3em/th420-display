@@ -1,8 +1,8 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::io::AsRawFd;
-use std::time::Duration;
 use std::thread;
+use std::time::Duration;
 
 const VID: &str = "264A";
 const PID: &str = "233C";
@@ -19,6 +19,12 @@ const BOOT_TRAILER_SIZE: usize = 16;
 const BOOT_FRAME_FLAGS: u32 = 0x4000_0008;
 const MIN_BOOT_FRAME_DELAY_MS: u32 = 80;
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DeviceStatus {
+    pub coolant_temp_c: f32,
+    pub pump_rpm: u16,
+}
+
 pub struct Device {
     ctrl: File,
     image: File,
@@ -33,17 +39,16 @@ impl Device {
             let entry = entry?;
             let name = entry.file_name().to_string_lossy().to_string();
 
-            let uevent = fs::read_to_string(
-                format!("/sys/class/hidraw/{}/device/uevent", name)
-            ).unwrap_or_default().to_uppercase();
+            let uevent = fs::read_to_string(format!("/sys/class/hidraw/{}/device/uevent", name))
+                .unwrap_or_default()
+                .to_uppercase();
 
             if !uevent.contains(VID) || !uevent.contains(PID) {
                 continue;
             }
 
             // Read sysfs symlink to determine interface (1.0 = ctrl, 1.1 = image)
-            let link = fs::read_link(format!("/sys/class/hidraw/{}", name))
-                .unwrap_or_default();
+            let link = fs::read_link(format!("/sys/class/hidraw/{}", name)).unwrap_or_default();
             let link_str = link.to_string_lossy();
 
             let dev = format!("/dev/{}", name);
@@ -58,16 +63,17 @@ impl Device {
             .read(true)
             .write(true)
             .open(ctrl_path.ok_or_else(|| {
-                io::Error::new(io::ErrorKind::NotFound,
-                    "TH420 control interface not found (VID 264A PID 233C)")
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "TH420 control interface not found (VID 264A PID 233C)",
+                )
             })?)?;
 
         let image = OpenOptions::new()
             .read(true)
             .write(true)
             .open(image_path.ok_or_else(|| {
-                io::Error::new(io::ErrorKind::NotFound,
-                    "TH420 image interface not found")
+                io::Error::new(io::ErrorKind::NotFound, "TH420 image interface not found")
             })?)?;
 
         Ok(Self { ctrl, image })
@@ -92,11 +98,16 @@ impl Device {
         Ok(())
     }
 
-    /// Query device for liquid coolant temperature.
-    pub fn read_liquid_temp(&mut self) -> io::Result<f32> {
+    /// Query the device status packet containing coolant temperature and pump RPM.
+    pub fn read_status(&mut self) -> io::Result<DeviceStatus> {
         self.ctrl_write(&[0x80, 0x01, 0x00, 0x80])?;
         let resp = self.ctrl_read()?;
-        parse_liquid_temp(&resp)
+        parse_status(&resp)
+    }
+
+    /// Query device for liquid coolant temperature.
+    pub fn read_liquid_temp(&mut self) -> io::Result<f32> {
+        self.read_status().map(|status| status.coolant_temp_c)
     }
 
     /// Stream JPEG data without writing a control-interface brightness value.
@@ -132,9 +143,7 @@ impl Device {
 
     /// Set the persistent RGB color of the standby pump-temperature overlay.
     pub fn set_pump_temperature_color(&mut self, rgb: [u8; 3]) -> io::Result<()> {
-        let command = [
-            0x16, 0x01, 0x00, 0x80, rgb[0], rgb[1], rgb[2], 0xff,
-        ];
+        let command = [0x16, 0x01, 0x00, 0x80, rgb[0], rgb[1], rgb[2], 0xff];
         self.ctrl_write(&command)?;
         // The vendor app repeats this write about 280 ms later. A single write
         // did not visibly update the color in a native Linux test.
@@ -149,7 +158,10 @@ impl Device {
     /// image over the display endpoint.
     pub fn upload_standby(&mut self, jpeg: &[u8]) -> io::Result<()> {
         if jpeg.is_empty() {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "standby JPEG is empty"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "standby JPEG is empty",
+            ));
         }
         let total = u32::try_from(jpeg.len()).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidInput, "standby JPEG is too large")
@@ -178,7 +190,10 @@ impl Device {
     /// Persist a boot-animation container built by `build_boot_container`.
     pub fn upload_boot(&mut self, container: &[u8], frame_delay_ms: u32) -> io::Result<()> {
         if container.is_empty() {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "boot container is empty"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "boot container is empty",
+            ));
         }
         if frame_delay_ms < MIN_BOOT_FRAME_DELAY_MS {
             return Err(io::Error::new(
@@ -257,51 +272,76 @@ impl Device {
     }
 }
 
+fn parse_status(resp: &[u8; CTRL_SIZE]) -> io::Result<DeviceStatus> {
+    // The status response starts `80 01 00 80 temp+0x24 temp+0x25 rpm_hi rpm_lo`.
+    let encoded = resp[4];
+    if resp[..4] != [0x80, 0x01, 0x00, 0x80]
+        || encoded < 0x24
+        || resp[5] != encoded.saturating_add(1)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid device status response",
+        ));
+    }
+    Ok(DeviceStatus {
+        coolant_temp_c: (encoded - 0x24) as f32,
+        pump_rpm: u16::from_be_bytes([resp[6], resp[7]]),
+    })
+}
+
+#[cfg(test)]
 fn parse_liquid_temp(resp: &[u8; CTRL_SIZE]) -> io::Result<f32> {
     // The status response starts `80 01 00 80 temp+0x24 temp+0x25 ...`.
     // The adjacent encoding acts as a small integrity check. Bytes 6-7 are
     // instead pump RPM (e.g. 09 10 = 2320 RPM).
-    let encoded = resp[4];
-    if encoded < 0x24 || resp[5] != encoded.saturating_add(1) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid liquid-temperature response",
-        ));
-    }
-    Ok((encoded - 0x24) as f32)
+    parse_status(resp).map(|status| status.coolant_temp_c)
 }
 
 /// Build the verified `Update_Boot_GIF` container from encoded JPEG frames.
 pub fn build_boot_container(frames: &[Vec<u8>]) -> io::Result<Vec<u8>> {
     if frames.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "boot GIF has no frames"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "boot GIF has no frames",
+        ));
     }
     let frame_count = u8::try_from(frames.len()).map_err(|_| {
-        io::Error::new(io::ErrorKind::InvalidInput, "boot GIF has more than 255 frames")
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "boot GIF has more than 255 frames",
+        )
     })?;
     if frames.iter().any(|frame| frame.is_empty()) {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "boot GIF has an empty frame"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "boot GIF has an empty frame",
+        ));
     }
 
-    let table_len = frames.len().checked_mul(BOOT_FRAME_ENTRY_SIZE).ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidInput, "boot frame table is too large")
-    })?;
+    let table_len = frames
+        .len()
+        .checked_mul(BOOT_FRAME_ENTRY_SIZE)
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "boot frame table is too large")
+        })?;
     let mut record_offset = BOOT_HEADER_SIZE.checked_add(table_len).ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "boot container is too large")
     })?;
     let mut entries = Vec::with_capacity(frames.len());
 
     for frame in frames {
-        let jpeg_size = u32::try_from(frame.len()).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidInput, "boot JPEG is too large")
-        })?;
+        let jpeg_size = u32::try_from(frame.len())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "boot JPEG is too large"))?;
         let offset = u32::try_from(record_offset).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidInput, "boot container is too large")
         })?;
         let record_end = record_offset
             .checked_add(BOOT_RECORD_NAME_SIZE)
             .and_then(|value| value.checked_add(frame.len()))
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "boot container is too large"))?;
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "boot container is too large")
+            })?;
         let record_end_i32 = i32::try_from(record_end).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidInput, "boot container is too large")
         })?;
@@ -309,19 +349,19 @@ pub fn build_boot_container(frames: &[Vec<u8>]) -> io::Result<Vec<u8>> {
         record_offset = record_end;
     }
 
-    let data_end = u32::try_from(record_offset).map_err(|_| {
-        io::Error::new(io::ErrorKind::InvalidInput, "boot container is too large")
-    })?;
-    let container_len = record_offset.checked_add(BOOT_TRAILER_SIZE).ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidInput, "boot container is too large")
-    })?;
+    let data_end = u32::try_from(record_offset)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "boot container is too large"))?;
+    let container_len = record_offset
+        .checked_add(BOOT_TRAILER_SIZE)
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "boot container is too large")
+        })?;
     let checksum_input = u64::from(data_end)
         + u64::try_from(table_len).unwrap()
         + BOOT_TRAILER_SIZE as u64
         + u64::from(frame_count);
-    let checksum = -i32::try_from(checksum_input).map_err(|_| {
-        io::Error::new(io::ErrorKind::InvalidInput, "boot container is too large")
-    })?;
+    let checksum = -i32::try_from(checksum_input)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "boot container is too large"))?;
 
     let mut container = Vec::with_capacity(container_len);
     container.extend_from_slice(&checksum.to_le_bytes());
@@ -361,7 +401,10 @@ fn poll_read(file: &File, timeout_ms: i32) -> io::Result<()> {
         libc::poll(&mut pfd as *mut libc::pollfd, 1, timeout_ms)
     };
     match ret {
-        0 => Err(io::Error::new(io::ErrorKind::TimedOut, "device did not respond")),
+        0 => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "device did not respond",
+        )),
         n if n < 0 => Err(io::Error::last_os_error()),
         _ => Ok(()),
     }
@@ -374,10 +417,19 @@ mod tests {
 
     fn temp_file(name: &str) -> (std::path::PathBuf, File) {
         let path = std::env::temp_dir().join(format!(
-            "th420-device-{name}-{}-{}", std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            "th420-device-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
-        let file = OpenOptions::new().read(true).write(true).create_new(true).open(&path).unwrap();
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
         (path, file)
     }
 
@@ -396,15 +448,30 @@ mod tests {
         let container = build_boot_container(&[vec![1, 2, 3, 4], vec![5, 6, 7]]).unwrap();
 
         assert_eq!(container.len(), 103);
-        assert_eq!(i32::from_le_bytes(container[0..4].try_into().unwrap()), -137);
+        assert_eq!(
+            i32::from_le_bytes(container[0..4].try_into().unwrap()),
+            -137
+        );
         assert_eq!(u32::from_le_bytes(container[4..8].try_into().unwrap()), 87);
         assert_eq!(u32::from_le_bytes(container[8..12].try_into().unwrap()), 32);
         assert_eq!(&container[16..32], b"Update_Boot_GIF\0");
-        assert_eq!(i32::from_le_bytes(container[32..36].try_into().unwrap()), -76);
-        assert_eq!(u32::from_le_bytes(container[36..40].try_into().unwrap()), 64);
+        assert_eq!(
+            i32::from_le_bytes(container[32..36].try_into().unwrap()),
+            -76
+        );
+        assert_eq!(
+            u32::from_le_bytes(container[36..40].try_into().unwrap()),
+            64
+        );
         assert_eq!(u32::from_le_bytes(container[40..44].try_into().unwrap()), 4);
-        assert_eq!(i32::from_le_bytes(container[48..52].try_into().unwrap()), -87);
-        assert_eq!(u32::from_le_bytes(container[52..56].try_into().unwrap()), 76);
+        assert_eq!(
+            i32::from_le_bytes(container[48..52].try_into().unwrap()),
+            -87
+        );
+        assert_eq!(
+            u32::from_le_bytes(container[52..56].try_into().unwrap()),
+            76
+        );
         assert_eq!(&container[64..76], b"000.jpg\0\x01\x02\x03\x04");
         assert_eq!(&container[76..87], b"001.jpg\0\x05\x06\x07");
         assert_eq!(&container[87..102], &[0; 15]);
@@ -433,7 +500,10 @@ mod tests {
         assert_eq!(&bytes[..4], &[0x08, 2, 0, 0x80]);
         assert_eq!(&bytes[4..4 + IMG_DATA_SIZE], &jpeg[..IMG_DATA_SIZE]);
         assert_eq!(&bytes[IMG_PKT_SIZE..IMG_PKT_SIZE + 4], &[0x08, 1, 0, 0]);
-        assert_eq!(&bytes[IMG_PKT_SIZE + 4..IMG_PKT_SIZE + 7], &jpeg[IMG_DATA_SIZE..]);
+        assert_eq!(
+            &bytes[IMG_PKT_SIZE + 4..IMG_PKT_SIZE + 7],
+            &jpeg[IMG_DATA_SIZE..]
+        );
 
         drop(device);
         fs::remove_file(ctrl_path).unwrap();
