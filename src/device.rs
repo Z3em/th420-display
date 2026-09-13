@@ -141,6 +141,11 @@ impl Device {
         self.ctrl_write(&[0x12, 0x01, 0x00, 0x80, brightness])
     }
 
+    /// Show or hide the persistent pump-temperature overlay on the standby image.
+    pub fn set_pump_temperature_visible(&mut self, visible: bool) -> io::Result<()> {
+        self.ctrl_write(&[0x18, 0x01, 0x00, 0x80, if visible { 0x00 } else { 0x02 }])
+    }
+
     /// Set the persistent RGB color of the standby pump-temperature overlay.
     pub fn set_pump_temperature_color(&mut self, rgb: [u8; 3]) -> io::Result<()> {
         let command = [0x16, 0x01, 0x00, 0x80, rgb[0], rgb[1], rgb[2], 0xff];
@@ -523,6 +528,28 @@ mod tests {
         device.ctrl.read_exact(&mut command).unwrap();
         assert_eq!(&command[..5], &[0x12, 0x01, 0, 0x80, 42]);
         assert!(command[5..].iter().all(|&b| b == 0));
+
+        drop(device);
+        fs::remove_file(ctrl_path).unwrap();
+        fs::remove_file(image_path).unwrap();
+    }
+
+    #[test]
+    fn pump_temperature_visibility_writes_protocol_values() {
+        let (ctrl_path, ctrl) = temp_file("overlay-ctrl");
+        let (image_path, image) = temp_file("overlay-image");
+        let mut device = Device { ctrl, image };
+        device.set_pump_temperature_visible(false).unwrap();
+        device.set_pump_temperature_visible(true).unwrap();
+
+        device.ctrl.seek(SeekFrom::Start(0)).unwrap();
+        let mut commands = [0; CTRL_SIZE * 2];
+        device.ctrl.read_exact(&mut commands).unwrap();
+        assert_eq!(&commands[..5], &[0x18, 0x01, 0, 0x80, 0x02]);
+        assert_eq!(
+            &commands[CTRL_SIZE..CTRL_SIZE + 5],
+            &[0x18, 0x01, 0, 0x80, 0x00]
+        );
 
         drop(device);
         fs::remove_file(ctrl_path).unwrap();

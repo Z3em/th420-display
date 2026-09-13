@@ -181,6 +181,9 @@ th420-display --upload-standby picture.png \
 # Set persistent screen brightness without replacing the standby picture
 th420-display --standby-brightness 60
 
+# Hide the coolant-temperature text from the standby picture
+th420-display --pump-temp-overlay hide
+
 # Store a boot animation from an animated GIF
 th420-display --upload-boot animation.gif
 

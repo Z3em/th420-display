@@ -125,6 +125,7 @@ struct App {
     confirm_delete_profile: Option<String>,
 
     brightness: u8,
+    pump_temp_visible: bool,
     pump_color: [f32; 3],
     standby_path: Option<PathBuf>,
     boot_path: Option<PathBuf>,
@@ -221,6 +222,7 @@ impl App {
             profile_name_edit: String::new(),
             confirm_delete_profile: None,
             brightness: 80,
+            pump_temp_visible: true,
             pump_color: [1.0, 1.0, 1.0],
             standby_path: None,
             boot_path: None,
@@ -1120,6 +1122,28 @@ impl App {
                     self.start_cli_job(
                         "Set brightness",
                         vec!["--standby-brightness".into(), self.brightness.to_string()],
+                    );
+                }
+                ui.separator();
+                ui.checkbox(&mut self.pump_temp_visible, "Show coolant temperature text");
+                if ui
+                    .add_enabled(
+                        self.media_job.is_none() && self.device_info.connected,
+                        egui::Button::new("Apply text visibility"),
+                    )
+                    .clicked()
+                {
+                    self.start_cli_job(
+                        "Set coolant text visibility",
+                        vec![
+                            "--pump-temp-overlay".into(),
+                            if self.pump_temp_visible {
+                                "show"
+                            } else {
+                                "hide"
+                            }
+                            .into(),
+                        ],
                     );
                 }
             });

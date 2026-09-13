@@ -151,6 +151,9 @@ brightness: app exit writes 100 when enabled and 0 when disabled. It is not a
 separate boolean in the observed protocol. Likewise, the UI's LCD on/off switch
 is a brightness wrapper, not a separate power command.
 
+Use `th420-display --pump-temp-overlay hide` to hide the coolant-temperature
+text on the persistent standby image; pass `show` to restore it.
+
 Text color is staged, not committed by `0x16` alone. A native color-only write
 was ignored; the verified vendor-compatible transaction is two `0x16` writes,
 then a standby upload, then optional brightness. The CLI therefore requires

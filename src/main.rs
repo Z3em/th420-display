@@ -4,7 +4,7 @@ mod renderer;
 mod sensors;
 
 use anyhow::{bail, Result};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use config::{default_config_path, Config};
 use image::codecs::gif::GifDecoder;
 use image::{imageops, AnimationDecoder};
@@ -16,6 +16,18 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 const MAX_BOOT_CONTAINER_SIZE: usize = 5 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum PumpTempOverlay {
+    Show,
+    Hide,
+}
+
+impl PumpTempOverlay {
+    fn visible(self) -> bool {
+        matches!(self, Self::Show)
+    }
+}
 
 #[derive(Parser)]
 #[command(
@@ -46,6 +58,10 @@ struct Cli {
     /// Set pump-temperature text color as #RRGGBB; requires --upload-standby.
     #[arg(long, value_name = "#RRGGBB")]
     pump_temp_color: Option<String>,
+
+    /// Show or hide the coolant-temperature text on the standby image.
+    #[arg(long, value_name = "show|hide")]
+    pump_temp_overlay: Option<PumpTempOverlay>,
 
     /// Upload an animated GIF as the persistent boot animation, then exit.
     #[arg(long, value_name = "GIF")]
@@ -168,6 +184,7 @@ fn validate_cli(cli: &Cli) -> Result<()> {
         && (cli.upload_standby.is_some()
             || cli.standby_brightness.is_some()
             || cli.pump_temp_color.is_some()
+            || cli.pump_temp_overlay.is_some()
             || cli.upload_boot.is_some()
             || !cli.play_live_frames.is_empty()
             || cli.play_live_gif.is_some())
@@ -178,6 +195,7 @@ fn validate_cli(cli: &Cli) -> Result<()> {
         && (cli.upload_standby.is_some()
             || cli.standby_brightness.is_some()
             || cli.pump_temp_color.is_some()
+            || cli.pump_temp_overlay.is_some()
             || !cli.play_live_frames.is_empty()
             || cli.play_live_gif.is_some())
     {
@@ -189,7 +207,8 @@ fn validate_cli(cli: &Cli) -> Result<()> {
     if (!cli.play_live_frames.is_empty() || cli.play_live_gif.is_some())
         && (cli.upload_standby.is_some()
             || cli.standby_brightness.is_some()
-            || cli.pump_temp_color.is_some())
+            || cli.pump_temp_color.is_some()
+            || cli.pump_temp_overlay.is_some())
     {
         bail!("live playback cannot be combined with persistent settings");
     }
@@ -302,6 +321,7 @@ fn main() -> Result<()> {
     if cli.upload_standby.is_some()
         || cli.standby_brightness.is_some()
         || cli.pump_temp_color.is_some()
+        || cli.pump_temp_overlay.is_some()
     {
         let encoded = if let Some(path) = &cli.upload_standby {
             Some((path, encode_jpeg(path)?))
@@ -330,6 +350,13 @@ fn main() -> Result<()> {
             );
             dev.upload_standby(&encoded)?;
             println!("Standby image upload complete.");
+        }
+        if let Some(overlay) = cli.pump_temp_overlay {
+            dev.set_pump_temperature_visible(overlay.visible())?;
+            println!(
+                "Pump-temperature text {}.",
+                if overlay.visible() { "shown" } else { "hidden" }
+            );
         }
         if let Some(brightness) = cli.standby_brightness {
             dev.set_brightness(brightness)?;
@@ -400,6 +427,7 @@ mod tests {
             upload_standby: None,
             standby_brightness: None,
             pump_temp_color: None,
+            pump_temp_overlay: None,
             upload_boot: None,
             play_live_frames: vec![],
             play_live_gif: None,
@@ -453,6 +481,7 @@ mod tests {
         options.upload_standby = Some("standby.png".into());
         options.pump_temp_color = Some("#0055ff".into());
         options.standby_brightness = Some(80);
+        options.pump_temp_overlay = Some(PumpTempOverlay::Hide);
         assert!(validate_cli(&options).is_ok());
     }
 
