@@ -47,7 +47,9 @@ mv th420-display-*.AppImage ~/Applications/
 # Alternatively, KDE Plasma 6 will offer to integrate it when you first run it from Dolphin.
 ```
 
-The GUI handles everything else: start/stop the daemon, enable/disable autostart via systemd.
+The GUI handles daemon start/stop and chooses systemd user services or the
+installed runit service automatically from PID 1. Unsupported init systems keep
+direct daemon controls but do not offer automatic service/autostart management.
 
 ---
 
@@ -91,7 +93,7 @@ make appimage
 ## GUI features
 
 - **Daemon control** — start / stop with one click; status shown live
-- **Autostart** — enable / disable systemd user service (`~/.config/systemd/user/th420-display.service`)
+- **Autostart** — enable / disable the detected systemd user service or runit service
 - **Screen rotation** — slider + quick 0° / 90° / 180° / 270° buttons
 - **Background image** — browse for any PNG/JPG, choose Cover / Contain / Stretch fit and darken level
 - **Layout presets** — Classic, Grid 2×3, Big Top, Custom (with per-sensor position and font size)

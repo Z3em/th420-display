@@ -1,6 +1,7 @@
 mod config;
 mod renderer;
 mod sensors;
+mod service_manager;
 
 use config::{
     interpolate_color, ColorPoint, Config, ImageFit, LayoutPreset, LayoutSlot,
@@ -9,6 +10,7 @@ use config::{
 use eframe::egui;
 use renderer::{Renderer, format_value};
 use sensors::SensorValues;
+use service_manager::ServiceManager;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -143,7 +145,8 @@ struct App {
     preview_texture: Option<egui::TextureHandle>,
     last_preview: Instant,
     config_dirty: bool,
-    daemon_pid: Option<u32>,
+    service_manager: ServiceManager,
+    daemon_running: bool,
     last_daemon_check: Instant,
     autostart_enabled: bool,
     last_autostart_check: Instant,
@@ -164,11 +167,14 @@ impl App {
             preview_texture: None,
             last_preview: Instant::now() - Duration::from_secs(10),
             config_dirty: false,
-            daemon_pid: daemon_pid(),
+            service_manager: ServiceManager::detect(),
+            daemon_running: false,
             last_daemon_check: Instant::now(),
-            autostart_enabled: check_autostart(),
+            autostart_enabled: false,
             last_autostart_check: Instant::now(),
         };
+        app.daemon_running = app.service_manager.daemon_running();
+        app.autostart_enabled = app.service_manager.autostart_enabled();
         app.refresh_sensors();
         app
     }
@@ -186,7 +192,8 @@ impl App {
             preview_texture: None,
             last_preview: Instant::now() - Duration::from_secs(10),
             config_dirty: false,
-            daemon_pid: None,
+            service_manager: ServiceManager::detect(),
+            daemon_running: false,
             last_daemon_check: Instant::now(),
             autostart_enabled: false,
             last_autostart_check: Instant::now(),
@@ -222,24 +229,6 @@ impl App {
     }
 }
 
-// ── Daemon management ─────────────────────────────────────────────────────────
-
-fn daemon_pid() -> Option<u32> {
-    let entries = std::fs::read_dir("/proc").ok()?;
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-        if !name_str.chars().all(|c| c.is_ascii_digit()) { continue; }
-        let cmdline = std::fs::read_to_string(entry.path().join("cmdline"))
-            .unwrap_or_default();
-        let exe = cmdline.split('\0').next().unwrap_or("");
-        if exe.ends_with("th420-display") {
-            return name_str.parse().ok();
-        }
-    }
-    None
-}
-
 /// When running from an AppImage, extract the daemon binary to ~/.local/bin/
 /// so it has a stable path usable by systemd services and direct invocation.
 fn extract_daemon_from_appimage() -> Option<PathBuf> {
@@ -271,45 +260,6 @@ fn daemon_binary_path() -> PathBuf {
         .ok()
         .and_then(|p| p.parent().map(|d| d.join("th420-display")))
         .unwrap_or_else(|| PathBuf::from("th420-display"))
-}
-
-fn start_daemon() {
-    let _ = std::process::Command::new(daemon_binary_path()).spawn();
-}
-
-fn stop_daemon(pid: u32) {
-    unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM); }
-}
-
-fn check_autostart() -> bool {
-    std::process::Command::new("systemctl")
-        .args(["--user", "is-enabled", "th420-display"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-fn enable_autostart() {
-    let service_dir = dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from(".config"))
-        .join("systemd/user");
-    let _ = std::fs::create_dir_all(&service_dir);
-    let content = format!(
-        "[Unit]\nDescription=Thermaltake TH420 V2 LCD display daemon\nAfter=graphical-session.target\n\n\
-         [Service]\nExecStart={}\nRestart=on-failure\nRestartSec=3\n\n\
-         [Install]\nWantedBy=default.target\n",
-        daemon_binary_path().to_string_lossy()
-    );
-    let _ = std::fs::write(service_dir.join("th420-display.service"), content);
-    let _ = std::process::Command::new("systemctl")
-        .args(["--user", "daemon-reload"]).output();
-    let _ = std::process::Command::new("systemctl")
-        .args(["--user", "enable", "th420-display"]).output();
-}
-
-fn disable_autostart() {
-    let _ = std::process::Command::new("systemctl")
-        .args(["--user", "disable", "th420-display"]).output();
 }
 
 // ── Gradient bar ──────────────────────────────────────────────────────────────
@@ -476,11 +426,11 @@ impl eframe::App for App {
             self.last_sensor_update = Instant::now();
         }
         if self.last_daemon_check.elapsed() > Duration::from_secs(2) {
-            self.daemon_pid = daemon_pid();
+            self.daemon_running = self.service_manager.daemon_running();
             self.last_daemon_check = Instant::now();
         }
         if self.last_autostart_check.elapsed() > Duration::from_secs(5) {
-            self.autostart_enabled = check_autostart();
+            self.autostart_enabled = self.service_manager.autostart_enabled();
             self.last_autostart_check = Instant::now();
         }
         if self.preview_texture.is_none()
@@ -501,7 +451,7 @@ impl eframe::App for App {
                     ui.add_space(6.0);
 
                     // Daemon + Autostart management
-                    let running = self.daemon_pid.is_some();
+                    let running = self.daemon_running;
                     ui.horizontal(|ui| {
                         let color = if running {
                             egui::Color32::from_rgb(80, 220, 80)
@@ -512,13 +462,14 @@ impl eframe::App for App {
                         ui.label(egui::RichText::new(label).color(color).small());
                         if running {
                             if ui.small_button("■ Stop").clicked() {
-                                if let Some(pid) = self.daemon_pid {
-                                    stop_daemon(pid);
-                                    self.daemon_pid = None;
-                                }
+                                self.service_manager.stop();
+                                self.daemon_running = false;
+                            }
+                            if ui.small_button("↻ Restart").clicked() {
+                                self.service_manager.restart(&daemon_binary_path());
                             }
                         } else if ui.small_button("▶ Start").clicked() {
-                            start_daemon();
+                            self.service_manager.start(&daemon_binary_path());
                         }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.small_button("Reset all").on_hover_text("Reset entire config to defaults").clicked() {
@@ -527,6 +478,10 @@ impl eframe::App for App {
                             }
                         });
                     });
+                    ui.label(egui::RichText::new(format!(
+                        "Service manager: {}", self.service_manager.kind().name()
+                    )).small().color(egui::Color32::GRAY));
+                    if self.service_manager.kind().supports_autostart() {
                     ui.horizontal(|ui| {
                         let (label, color) = if self.autostart_enabled {
                             ("● Autostart: enabled", egui::Color32::from_rgb(80, 220, 80))
@@ -536,14 +491,19 @@ impl eframe::App for App {
                         ui.label(egui::RichText::new(label).color(color).small());
                         if self.autostart_enabled {
                             if ui.small_button("Disable").clicked() {
-                                disable_autostart();
-                                self.autostart_enabled = false;
+                                self.service_manager.disable_autostart();
+                                self.autostart_enabled = self.service_manager.autostart_enabled();
                             }
                         } else if ui.small_button("Enable").clicked() {
-                            enable_autostart();
-                            self.autostart_enabled = check_autostart();
+                            self.service_manager.enable_autostart(&daemon_binary_path());
+                            self.autostart_enabled = self.service_manager.autostart_enabled();
                         }
                     });
+                    } else {
+                        ui.label(egui::RichText::new(
+                            "Automatic service and autostart management is unavailable."
+                        ).small().color(egui::Color32::DARK_GRAY));
+                    }
                     ui.separator();
                     ui.add_space(4.0);
 
@@ -768,7 +728,7 @@ impl eframe::App for App {
                     }
 
                     ui.add_space(4.0);
-                    let apply_msg = if self.daemon_pid.is_some() {
+                    let apply_msg = if self.daemon_running {
                         "Config saved — daemon picks up changes instantly."
                     } else {
                         "Config saved — start daemon to apply to device."
@@ -801,7 +761,7 @@ impl eframe::App for App {
                 }
 
                 ui.add_space(12.0);
-                if self.daemon_pid.is_none() {
+                if !self.daemon_running {
                     ui.label(
                         egui::RichText::new("Coolant N/A — start daemon to see it.")
                             .small().color(egui::Color32::GRAY),
@@ -979,16 +939,6 @@ mod tests {
     }
 
     // ── daemon management ─────────────────────────────────────────────────────
-
-    #[test]
-    fn daemon_pid_returns_without_panic() {
-        let _: Option<u32> = daemon_pid();
-    }
-
-    #[test]
-    fn check_autostart_returns_without_panic() {
-        let _: bool = check_autostart();
-    }
 
     #[test]
     fn daemon_binary_path_returns_without_panic() {
