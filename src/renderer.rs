@@ -54,6 +54,10 @@ impl Renderer {
     }
 
     fn update_bg_cache(&mut self, config: &Config) {
+        if !config.background.enabled {
+            self.bg_cache = None;
+            return;
+        }
         let cached = self.bg_cache.as_ref().map(|(background, _)| background);
         if cached != Some(&config.background) {
             self.bg_cache = config.background.image_path.as_ref().and_then(|_| {
@@ -67,16 +71,29 @@ impl Renderer {
         let font = FontRef::try_from_slice(&self.font_bytes).expect("invalid font");
 
         // ── Base layer ────────────────────────────────────────────────────────
-        let mut img = if let Some((_, ref bg)) = self.bg_cache {
-            bg.clone()
+        let mut img = if config.background.enabled {
+            if let Some((_, ref bg)) = self.bg_cache {
+                bg.clone()
+            } else {
+                RgbImage::from_pixel(W, H, BG)
+            }
         } else {
             RgbImage::from_pixel(W, H, BG)
         };
 
-        // Only fill the circle with solid color when there is no background image —
-        // otherwise the fill would overwrite the loaded image.
-        if self.bg_cache.is_none() {
-            draw_filled_circle_mut(&mut img, (240, 240), 238, CIRCLE_BG);
+        // When enabled without an image, the configured canvas color becomes
+        // the solid-color source used by the GUI.
+        if config.background.enabled && self.bg_cache.is_none() {
+            draw_filled_circle_mut(
+                &mut img,
+                (240, 240),
+                238,
+                Rgb(config.background.background_color),
+            );
+        }
+
+        if !config.overlay_enabled {
+            return img;
         }
 
         // ── Divider line (only in Classic layout) ────────────────────────────

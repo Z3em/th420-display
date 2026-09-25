@@ -12,7 +12,7 @@ path = "src/main.rs"
 
 [[bin]]
 name = "th420-config"
-path = "src/gui_overhaul.rs"
+path = "src/gui_v2.rs"
 required-features = ["gui"]
 
 [features]

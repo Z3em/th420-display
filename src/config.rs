@@ -102,9 +102,14 @@ fn default_background_opacity() -> u8 {
 fn default_background_color() -> [u8; 3] {
     [10, 10, 20]
 }
+fn default_true() -> bool {
+    true
+}
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct BackgroundConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
     pub image_path: Option<String>,
     pub fit: ImageFit,
     pub overlay_alpha: u8,
@@ -131,6 +136,7 @@ pub struct BackgroundConfig {
 impl Default for BackgroundConfig {
     fn default() -> Self {
         Self {
+            enabled: true,
             image_path: None,
             fit: ImageFit::Cover,
             overlay_alpha: 80,
@@ -401,6 +407,8 @@ fn make_sensor(
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Config {
     pub rotation: f32,
+    #[serde(default = "default_true")]
+    pub overlay_enabled: bool,
     pub background: BackgroundConfig,
     pub layout: LayoutConfig,
     pub sensors: Vec<SensorConfig>,
@@ -449,6 +457,7 @@ impl Default for Config {
         let cpu_label = default_cpu_label();
         Self {
             rotation: 180.0,
+            overlay_enabled: true,
             background: BackgroundConfig::default(),
             layout: LayoutConfig::default(),
             sensors: vec![
