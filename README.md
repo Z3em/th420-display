@@ -195,7 +195,7 @@ th420-display --play-live-gif animation.gif
 Standby input is converted to a 480x480 JPEG. Boot GIF frames are resized to
 480x480 and encoded into the device's persistent boot format. Boot GIFs must
 have one uniform, integral frame delay of at least 80 ms; the project also
-enforces a conservative 5 MiB container limit. The boot and standby uploads,
+enforces a 10 MiB vendor-app container limit. The limit was observed in the reverse-engineered official Windows application. The boot and standby uploads,
 including persistence across a physical reconnect, have been verified on
 hardware.
 

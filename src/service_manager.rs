@@ -1,5 +1,7 @@
+use crate::instance::{current_owner, request_graceful, InstanceKind};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 const SERVICE_NAME: &str = "th420-display";
 const RUNIT_SERVICE_DIR: &str = "/etc/sv/th420-display";
@@ -81,17 +83,7 @@ impl ServiceManager {
     }
 
     pub fn daemon_running(&self) -> bool {
-        match self.kind {
-            BackendKind::Systemd => command_succeeds(
-                "systemctl",
-                &["--user", "is-active", "--quiet", SERVICE_NAME],
-            ),
-            // A runit host may have the service files installed but leave the
-            // service disabled. In that case the GUI's Start button uses the
-            // same direct-launch behavior as unmanaged mode.
-            BackendKind::Runit => runit_is_running() || daemon_pid().is_some(),
-            BackendKind::Unmanaged => daemon_pid().is_some(),
-        }
+        current_owner(InstanceKind::Daemon).is_some()
     }
 
     pub fn autostart_enabled(&self) -> bool {
@@ -104,27 +96,33 @@ impl ServiceManager {
         }
     }
 
-    pub fn start(&self, daemon: &Path) {
-        match self.kind {
+    pub fn start(&self, daemon: &Path) -> bool {
+        if self.daemon_running() {
+            return true;
+        }
+        let requested = match self.kind {
             BackendKind::Systemd => {
                 if install_systemd_unit(daemon) {
-                    run_command("systemctl", &["--user", "start", SERVICE_NAME]);
+                    run_command("systemctl", &["--user", "start", SERVICE_NAME])
+                } else {
+                    false
                 }
             }
             BackendKind::Runit => {
                 if !runit_service_enabled(Path::new(RUNIT_ACTIVE_SERVICE))
                     || !run_command("sv", &["up", RUNIT_ACTIVE_SERVICE])
                 {
-                    let _ = Command::new(daemon).spawn();
+                    spawn_reaped(daemon)
+                } else {
+                    true
                 }
             }
-            BackendKind::Unmanaged => {
-                let _ = Command::new(daemon).spawn();
-            }
-        }
+            BackendKind::Unmanaged => spawn_reaped(daemon),
+        };
+        requested && wait_for_daemon_start(Duration::from_secs(3))
     }
 
-    pub fn stop(&self) {
+    pub fn stop(&self) -> bool {
         match self.kind {
             BackendKind::Systemd => {
                 let _ = run_command("systemctl", &["--user", "stop", SERVICE_NAME]);
@@ -133,13 +131,14 @@ impl ServiceManager {
                 if !runit_service_enabled(Path::new(RUNIT_ACTIVE_SERVICE))
                     || !run_command("sv", &["down", RUNIT_ACTIVE_SERVICE])
                 {
-                    stop_direct_daemon();
+                    return stop_direct_daemon();
                 }
             }
             BackendKind::Unmanaged => {
-                stop_direct_daemon();
+                return stop_direct_daemon();
             }
         }
+        wait_for_daemon_stop(Duration::from_secs(5))
     }
 
     pub fn restart(&self, daemon: &Path) {
@@ -154,12 +153,12 @@ impl ServiceManager {
                     || !run_command("sv", &["restart", RUNIT_ACTIVE_SERVICE])
                 {
                     stop_direct_daemon();
-                    let _ = Command::new(daemon).spawn();
+                    spawn_reaped(daemon);
                 }
             }
             BackendKind::Unmanaged => {
                 self.stop();
-                self.start(daemon);
+                let _ = self.start(daemon);
             }
         }
     }
@@ -185,6 +184,16 @@ impl ServiceManager {
             BackendKind::Unmanaged => {}
         }
     }
+}
+
+fn spawn_reaped(daemon: &Path) -> bool {
+    let Ok(mut child) = Command::new(daemon).spawn() else {
+        return false;
+    };
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    true
 }
 
 fn command_succeeds(program: &str, args: &[&str]) -> bool {
@@ -223,19 +232,6 @@ fn install_systemd_unit(daemon: &Path) -> bool {
     true
 }
 
-fn runit_is_running() -> bool {
-    let output = match Command::new("sv")
-        .args(["status", RUNIT_ACTIVE_SERVICE])
-        .output()
-    {
-        Ok(output) => output,
-        Err(_) => return false,
-    };
-    String::from_utf8_lossy(&output.stdout)
-        .trim_start()
-        .starts_with("run:")
-}
-
 fn runit_service_enabled(active_service: &Path) -> bool {
     std::fs::symlink_metadata(active_service)
         .map(|metadata| metadata.file_type().is_symlink())
@@ -264,33 +260,33 @@ fn disable_runit() {
     }
 }
 
-fn daemon_pid() -> Option<u32> {
-    let entries = std::fs::read_dir("/proc").ok()?;
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if !name.chars().all(|c| c.is_ascii_digit()) {
-            continue;
-        }
-        let cmdline = std::fs::read_to_string(entry.path().join("cmdline")).unwrap_or_default();
-        if cmdline
-            .split('\0')
-            .next()
-            .unwrap_or("")
-            .ends_with(SERVICE_NAME)
-        {
-            return name.parse().ok();
-        }
-    }
-    None
+fn stop_direct_daemon() -> bool {
+    let Some(owner) = current_owner(InstanceKind::Daemon) else {
+        return true;
+    };
+    request_graceful(&owner, Duration::from_secs(5)).is_ok()
 }
 
-fn stop_direct_daemon() {
-    if let Some(pid) = daemon_pid() {
-        unsafe {
-            libc::kill(pid as libc::pid_t, libc::SIGTERM);
+fn wait_for_daemon_stop(timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if current_owner(InstanceKind::Daemon).is_none() {
+            return true;
         }
+        std::thread::sleep(Duration::from_millis(50));
     }
+    false
+}
+
+fn wait_for_daemon_start(timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if current_owner(InstanceKind::Daemon).is_some() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    false
 }
 
 #[cfg(test)]

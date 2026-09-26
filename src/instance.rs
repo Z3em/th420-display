@@ -1,0 +1,618 @@
+use clap::ValueEnum;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Seek, Write};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum ReplaceExisting {
+    Graceful,
+    Term,
+    Kill,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // Each binary uses one variant from this shared source module.
+pub enum InstanceKind {
+    Gui,
+    Daemon,
+}
+
+impl InstanceKind {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Gui => "gui",
+            Self::Daemon => "daemon",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OwnerInfo {
+    pub pid: u32,
+    pub uid: u32,
+    pub start_ticks: u64,
+    pub executable: PathBuf,
+    pub command_line: String,
+    pub lock_path: PathBuf,
+    pub socket_path: PathBuf,
+}
+
+impl OwnerInfo {
+    pub fn describe(&self) -> String {
+        format!(
+            "PID: {}\nUser/UID: {} ({})\nExecutable: {}\nStart time (clock ticks): {}\nCommand: {}\nLock: {}\nControl socket: {}",
+            self.pid,
+            user_name(self.uid),
+            self.uid,
+            self.executable.display(),
+            self.start_ticks,
+            self.command_line,
+            self.lock_path.display(),
+            self.socket_path.display(),
+        )
+    }
+}
+
+#[derive(Debug)]
+pub enum AcquireError {
+    Conflict(OwnerInfo),
+    Other(String),
+}
+
+pub struct InstanceGuard {
+    lock_file: File,
+    socket_path: PathBuf,
+    listener_stop: Arc<AtomicBool>,
+    listener: Option<JoinHandle<()>>,
+}
+
+#[allow(dead_code)] // Device ownership is used by the daemon binary, not the GUI binary.
+pub struct DeviceGuard {
+    lock_file: File,
+}
+
+impl DeviceGuard {
+    #[allow(dead_code)]
+    pub fn acquire() -> Result<Self, String> {
+        let (lock_path, _) = instance_paths(InstanceKind::Daemon)?;
+        let lock_path = lock_path.with_file_name("th420-display-device.lock");
+        let mut lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&lock_path)
+            .map_err(|error| format!("cannot open device lock {}: {error}", lock_path.display()))?;
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            let owner = read_device_owner(&lock_path)
+                .map(|owner| format!("\n{}", owner.describe()))
+                .unwrap_or_default();
+            return Err(format!(
+                "the TH420 device is already owned by another process{owner}"
+            ));
+        }
+        write_owner_record(&mut lock)
+            .map_err(|error| format!("cannot record device ownership: {error}"))?;
+        Ok(Self { lock_file: lock })
+    }
+}
+
+impl Drop for DeviceGuard {
+    fn drop(&mut self) {
+        let _ = self.lock_file.set_len(0);
+        let _ = unsafe { libc::flock(self.lock_file.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
+impl InstanceGuard {
+    pub fn try_acquire(
+        kind: InstanceKind,
+        shutdown_requested: Arc<AtomicBool>,
+    ) -> Result<Self, AcquireError> {
+        let (lock_path, socket_path) = instance_paths(kind).map_err(AcquireError::Other)?;
+        Self::try_acquire_paths(lock_path, socket_path, shutdown_requested)
+    }
+
+    fn try_acquire_paths(
+        lock_path: PathBuf,
+        socket_path: PathBuf,
+        shutdown_requested: Arc<AtomicBool>,
+    ) -> Result<Self, AcquireError> {
+        let mut lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&lock_path)
+            .map_err(|error| {
+                AcquireError::Other(format!(
+                    "cannot open instance lock {}: {error}",
+                    lock_path.display()
+                ))
+            })?;
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            let owner = read_owner(&lock_path, &socket_path)
+                .filter(validate_owner)
+                .ok_or_else(|| {
+                    AcquireError::Other(
+                        "instance lock is held but its owner metadata is unavailable".into(),
+                    )
+                })?;
+            return Err(AcquireError::Conflict(owner));
+        }
+        {
+            if let Err(error) = write_owner_record(&mut lock) {
+                return Err(AcquireError::Other(format!(
+                    "cannot write instance lock: {error}"
+                )));
+            }
+
+            let _ = fs::remove_file(&socket_path);
+            let listener = match UnixListener::bind(&socket_path) {
+                Ok(listener) => listener,
+                Err(error) => {
+                    return Err(AcquireError::Other(format!(
+                        "cannot create control socket {}: {error}",
+                        socket_path.display()
+                    )));
+                }
+            };
+            let _ = fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600));
+            if let Err(error) = listener.set_nonblocking(true) {
+                let _ = fs::remove_file(&socket_path);
+                return Err(AcquireError::Other(format!(
+                    "cannot configure control socket: {error}"
+                )));
+            }
+            let listener_stop = Arc::new(AtomicBool::new(false));
+            let thread_stop = listener_stop.clone();
+            let listener_thread = thread::spawn(move || {
+                while !thread_stop.load(Ordering::Relaxed) {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            let mut command = [0_u8; 32];
+                            if let Ok(count) = stream.read(&mut command) {
+                                if command[..count].starts_with(b"shutdown") {
+                                    shutdown_requested.store(true, Ordering::SeqCst);
+                                    let _ = stream.write_all(b"ok\n");
+                                }
+                            }
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(25));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+            Ok(Self {
+                lock_file: lock,
+                socket_path,
+                listener_stop,
+                listener: Some(listener_thread),
+            })
+        }
+    }
+}
+
+impl Drop for InstanceGuard {
+    fn drop(&mut self) {
+        self.listener_stop.store(true, Ordering::Relaxed);
+        if let Some(listener) = self.listener.take() {
+            let _ = listener.join();
+        }
+        let _ = fs::remove_file(&self.socket_path);
+        let _ = self.lock_file.set_len(0);
+        let _ = unsafe { libc::flock(self.lock_file.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
+pub fn request_graceful(owner: &OwnerInfo, timeout: Duration) -> Result<(), String> {
+    let verified = revalidate_owner(owner)?;
+    let mut stream = UnixStream::connect(&verified.socket_path).map_err(|error| {
+        format!(
+            "cannot connect to {}: {error}",
+            verified.socket_path.display()
+        )
+    })?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(1)))
+        .map_err(|error| error.to_string())?;
+    stream
+        .write_all(b"shutdown\n")
+        .map_err(|error| format!("cannot request graceful shutdown: {error}"))?;
+    wait_for_release(&verified, timeout)
+}
+
+pub fn signal_owner(owner: &OwnerInfo, signal: i32, timeout: Duration) -> Result<(), String> {
+    let verified = revalidate_owner(owner)?;
+    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, verified.pid as i32, 0) as i32 };
+    let result = if pidfd >= 0 {
+        revalidate_owner(&verified)?;
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                pidfd,
+                signal,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            ) as i32
+        };
+        unsafe { libc::close(pidfd) };
+        result
+    } else {
+        revalidate_owner(&verified)?;
+        unsafe { libc::kill(verified.pid as i32, signal) }
+    };
+    if result != 0 {
+        return Err(format!(
+            "failed to signal PID {}: {}",
+            verified.pid,
+            std::io::Error::last_os_error()
+        ));
+    }
+    wait_for_release(&verified, timeout)
+}
+
+pub fn replace_and_acquire(
+    kind: InstanceKind,
+    shutdown_requested: Arc<AtomicBool>,
+    level: ReplaceExisting,
+) -> Result<InstanceGuard, String> {
+    let owner = match InstanceGuard::try_acquire(kind, shutdown_requested.clone()) {
+        Ok(guard) => return Ok(guard),
+        Err(AcquireError::Conflict(owner)) => owner,
+        Err(AcquireError::Other(error)) => return Err(error),
+    };
+    let mut attempts = Vec::new();
+    attempts.push("graceful shutdown".to_string());
+    if request_graceful(&owner, Duration::from_secs(3)).is_ok() {
+        return acquire_after_exit(kind, shutdown_requested);
+    }
+    if matches!(level, ReplaceExisting::Graceful) {
+        return Err(replacement_failure(&owner, &attempts));
+    }
+    attempts.push("SIGTERM".to_string());
+    if signal_owner(&owner, libc::SIGTERM, Duration::from_secs(3)).is_ok() {
+        return acquire_after_exit(kind, shutdown_requested);
+    }
+    if matches!(level, ReplaceExisting::Term) {
+        return Err(replacement_failure(&owner, &attempts));
+    }
+    attempts.push("SIGKILL".to_string());
+    signal_owner(&owner, libc::SIGKILL, Duration::from_secs(3))
+        .map_err(|_| replacement_failure(&owner, &attempts))?;
+    acquire_after_exit(kind, shutdown_requested)
+}
+
+fn acquire_after_exit(
+    kind: InstanceKind,
+    shutdown_requested: Arc<AtomicBool>,
+) -> Result<InstanceGuard, String> {
+    InstanceGuard::try_acquire(kind, shutdown_requested).map_err(|error| match error {
+        AcquireError::Conflict(owner) => format!(
+            "another instance acquired ownership during replacement:\n{}",
+            owner.describe()
+        ),
+        AcquireError::Other(error) => error,
+    })
+}
+
+fn replacement_failure(owner: &OwnerInfo, attempts: &[String]) -> String {
+    let owner = refresh_owner(owner).unwrap_or_else(|_| owner.clone());
+    format!(
+        "could not replace the existing instance.\nAttempted: {}\n\n{}",
+        attempts.join(", "),
+        owner.describe()
+    )
+}
+
+pub fn refresh_owner(owner: &OwnerInfo) -> Result<OwnerInfo, String> {
+    revalidate_owner(owner)
+}
+
+#[allow(dead_code)] // Used by the GUI's service manager.
+pub fn current_owner(kind: InstanceKind) -> Option<OwnerInfo> {
+    let (lock_path, socket_path) = instance_paths(kind).ok()?;
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(&lock_path)
+        .ok()?;
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        let _ = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) };
+        return None;
+    }
+    read_owner(&lock_path, &socket_path).filter(validate_owner)
+}
+
+fn wait_for_release(owner: &OwnerInfo, timeout: Duration) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if lock_is_available(&owner.lock_path) {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    Err(format!(
+        "PID {} did not release ownership within {:?}",
+        owner.pid, timeout
+    ))
+}
+
+fn lock_is_available(path: &Path) -> bool {
+    let Ok(file) = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+    else {
+        return false;
+    };
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return false;
+    }
+    let _ = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+    true
+}
+
+fn revalidate_owner(expected: &OwnerInfo) -> Result<OwnerInfo, String> {
+    let current = read_owner(&expected.lock_path, &expected.socket_path)
+        .ok_or_else(|| "the recorded instance no longer exists".to_string())?;
+    if current.pid != expected.pid
+        || current.uid != expected.uid
+        || current.start_ticks != expected.start_ticks
+        || current.executable != expected.executable
+        || !validate_owner(&current)
+    {
+        return Err("instance identity changed; refusing to signal it".into());
+    }
+    Ok(current)
+}
+
+fn validate_owner(owner: &OwnerInfo) -> bool {
+    owner.uid == effective_uid()
+        && process_uid(owner.pid) == Some(owner.uid)
+        && process_start_ticks(owner.pid) == Some(owner.start_ticks)
+        && process_executable(owner.pid).as_ref() == Some(&owner.executable)
+}
+
+fn instance_paths(kind: InstanceKind) -> Result<(PathBuf, PathBuf), String> {
+    let uid = effective_uid();
+    let base = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .filter(|path| runtime_dir_is_safe(path, uid))
+        .unwrap_or_else(|| PathBuf::from(format!("/tmp/th420-display-{uid}")));
+    if !base.exists() {
+        fs::create_dir(&base)
+            .map_err(|error| format!("cannot create {}: {error}", base.display()))?;
+        fs::set_permissions(&base, fs::Permissions::from_mode(0o700))
+            .map_err(|error| format!("cannot secure {}: {error}", base.display()))?;
+    }
+    if !runtime_dir_is_safe(&base, uid) {
+        return Err(format!("unsafe runtime directory: {}", base.display()));
+    }
+    let stem = format!("th420-display-{}", kind.name());
+    Ok((
+        base.join(format!("{stem}.lock")),
+        base.join(format!("{stem}.sock")),
+    ))
+}
+
+fn runtime_dir_is_safe(path: &Path, uid: u32) -> bool {
+    fs::symlink_metadata(path)
+        .map(|metadata| metadata.is_dir() && metadata.uid() == uid && metadata.mode() & 0o022 == 0)
+        .unwrap_or(false)
+}
+
+fn read_owner(lock_path: &Path, socket_path: &Path) -> Option<OwnerInfo> {
+    let metadata = fs::symlink_metadata(lock_path).ok()?;
+    if !metadata.file_type().is_file() || metadata.uid() != effective_uid() {
+        return None;
+    }
+    let text = fs::read_to_string(lock_path).ok()?;
+    let field = |name: &str| {
+        text.lines()
+            .find_map(|line| line.strip_prefix(&format!("{name}=")))
+    };
+    let pid = field("pid")?.parse().ok()?;
+    let uid = field("uid")?.parse().ok()?;
+    let start_ticks = field("start")?.parse().ok()?;
+    let executable = PathBuf::from(unsafe {
+        std::ffi::OsString::from_encoded_bytes_unchecked(hex_decode(field("exe")?).ok()?)
+    });
+    Some(OwnerInfo {
+        pid,
+        uid,
+        start_ticks,
+        executable,
+        command_line: process_command_line(pid),
+        lock_path: lock_path.to_owned(),
+        socket_path: socket_path.to_owned(),
+    })
+}
+
+#[allow(dead_code)]
+fn read_device_owner(lock_path: &Path) -> Option<OwnerInfo> {
+    read_owner(lock_path, Path::new("<none>"))
+}
+
+fn write_owner_record(lock: &mut File) -> std::io::Result<()> {
+    let pid = std::process::id();
+    let uid = effective_uid();
+    let start_ticks = process_start_ticks(pid)
+        .ok_or_else(|| std::io::Error::other("cannot read own process start time"))?;
+    let executable = process_executable(pid)
+        .ok_or_else(|| std::io::Error::other("cannot read own executable"))?;
+    let token = format!(
+        "{}-{}-{}",
+        pid,
+        start_ticks,
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
+    let record = format!(
+        "pid={pid}\nuid={uid}\nstart={start_ticks}\nexe={}\ntoken={token}\n",
+        hex_encode(executable.as_os_str().as_encoded_bytes())
+    );
+    lock.set_len(0)?;
+    lock.rewind()?;
+    lock.write_all(record.as_bytes())?;
+    lock.sync_all()
+}
+
+fn process_start_ticks(pid: u32) -> Option<u64> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after_name = stat.rsplit_once(") ")?.1;
+    after_name.split_whitespace().nth(19)?.parse().ok()
+}
+
+fn process_uid(pid: u32) -> Option<u32> {
+    let status = fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("Uid:"))?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
+}
+
+fn process_executable(pid: u32) -> Option<PathBuf> {
+    fs::read_link(format!("/proc/{pid}/exe")).ok()
+}
+
+fn process_command_line(pid: u32) -> String {
+    fs::read(format!("/proc/{pid}/cmdline"))
+        .ok()
+        .map(|bytes| {
+            bytes
+                .split(|byte| *byte == 0)
+                .filter(|part| !part.is_empty())
+                .map(sanitize)
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .filter(|line| !line.is_empty())
+        .unwrap_or_else(|| "<unavailable>".into())
+}
+
+fn sanitize(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes)
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                '?'
+            } else {
+                character
+            }
+        })
+        .collect()
+}
+
+fn effective_uid() -> u32 {
+    unsafe { libc::geteuid() }
+}
+
+fn user_name(uid: u32) -> String {
+    std::env::var("USER").unwrap_or_else(|_| uid.to_string())
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn hex_decode(value: &str) -> Result<Vec<u8>, ()> {
+    if !value.len().is_multiple_of(2) {
+        return Err(());
+    }
+    (0..value.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&value[index..index + 2], 16).map_err(|_| ()))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proc_stat_parser_reads_current_process_identity() {
+        let pid = std::process::id();
+        assert!(process_start_ticks(pid).is_some());
+        assert_eq!(process_uid(pid), Some(effective_uid()));
+        assert!(process_executable(pid).is_some());
+    }
+
+    #[test]
+    fn hex_round_trip_handles_arbitrary_path_bytes() {
+        let bytes = b"/tmp/path with spaces/and-newline\n";
+        assert_eq!(hex_decode(&hex_encode(bytes)).unwrap(), bytes);
+    }
+
+    #[test]
+    fn command_line_sanitizer_removes_control_characters() {
+        assert_eq!(sanitize(b"hello\nworld\t"), "hello?world?");
+    }
+
+    #[test]
+    fn duplicate_is_rejected_and_graceful_shutdown_hands_off_lock() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "th420-instance-test-{}-{suffix}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let lock_path = directory.join("test.lock");
+        let socket_path = directory.join("test.sock");
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let guard = InstanceGuard::try_acquire_paths(
+            lock_path.clone(),
+            socket_path.clone(),
+            shutdown.clone(),
+        )
+        .unwrap();
+        let owner = match InstanceGuard::try_acquire_paths(
+            lock_path.clone(),
+            socket_path.clone(),
+            Arc::new(AtomicBool::new(false)),
+        ) {
+            Err(AcquireError::Conflict(owner)) => owner,
+            _ => panic!("second acquisition must report the verified owner"),
+        };
+        let dropper = thread::spawn(move || {
+            while !shutdown.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(5));
+            }
+            drop(guard);
+        });
+        request_graceful(&owner, Duration::from_secs(2)).unwrap();
+        dropper.join().unwrap();
+        let replacement = InstanceGuard::try_acquire_paths(
+            lock_path.clone(),
+            socket_path.clone(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        drop(replacement);
+        let _ = fs::remove_file(lock_path);
+        fs::remove_dir(directory).unwrap();
+    }
+}

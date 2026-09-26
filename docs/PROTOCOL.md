@@ -220,9 +220,9 @@ th420-display --upload-boot ANIMATION.gif
 It accepts GIF input only, converts each frame to a 480 x 480 RGB JPEG using
 Lanczos3, and builds the container above. It rejects an empty GIF, more than
 255 frames, non-integral-millisecond frame delays, non-uniform frame delays,
-delays below 80 ms, and containers over the project's conservative 5 MiB
-limit. The 80 ms and 5 MiB bounds are project safety guards, not documented
-firmware limits. `--upload-boot` is intentionally exclusive of live playback
+delays below 80 ms, and containers over the 10 MiB limit observed in the
+reverse-engineered official Windows application. The 80 ms bound is a project
+safety guard; the 10 MiB bound is vendor-app provenance, not a firmware specification. `--upload-boot` is intentionally exclusive of live playback
 and standby-setting arguments.
 
 The uniform-delay restriction follows the only timing field observed in the

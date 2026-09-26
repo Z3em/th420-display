@@ -93,7 +93,66 @@ pub enum ImageFit {
     Stretch,
 }
 
+/// Reusable canvas-space transform shared by backgrounds and prepared media.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+pub struct Transform2D {
+    pub pan_x: f32,
+    pub pan_y: f32,
+    pub zoom: f32,
+    pub stretch_x: f32,
+    pub stretch_y: f32,
+    pub rotation: f32,
+}
+
+impl Default for Transform2D {
+    fn default() -> Self {
+        Self {
+            pan_x: 0.0,
+            pan_y: 0.0,
+            zoom: 1.0,
+            stretch_x: 1.0,
+            stretch_y: 1.0,
+            rotation: 0.0,
+        }
+    }
+}
+
+/// Transform state for media prepared outside the live background config.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MediaTransform {
+    pub fit: ImageFit,
+    pub transform: Transform2D,
+    pub canvas_color: [u8; 3],
+}
+
+impl Default for MediaTransform {
+    fn default() -> Self {
+        Self {
+            // Preserve the former persistent-media behavior by filling 480x480.
+            fit: ImageFit::Stretch,
+            transform: Transform2D::default(),
+            canvas_color: [10, 10, 20],
+        }
+    }
+}
+
+impl BackgroundConfig {
+    pub fn transform(&self) -> Transform2D {
+        Transform2D {
+            pan_x: self.pan_x + self.offset_x * 240.0,
+            pan_y: self.pan_y + self.offset_y * 240.0,
+            zoom: self.zoom,
+            stretch_x: self.stretch_x,
+            stretch_y: self.stretch_y,
+            rotation: self.rotation,
+        }
+    }
+}
+
 fn default_background_zoom() -> f32 {
+    1.0
+}
+fn default_background_stretch() -> f32 {
     1.0
 }
 fn default_background_opacity() -> u8 {
@@ -119,9 +178,25 @@ pub struct BackgroundConfig {
     /// Horizontal image offset, normalized to half the 480 px canvas width.
     #[serde(default)]
     pub offset_x: f32,
+    /// Retained to migrate configurations written before pixel-based panning.
     /// Vertical image offset, normalized to half the 480 px canvas height.
     #[serde(default)]
     pub offset_y: f32,
+    /// Horizontal pan in display pixels.
+    #[serde(default)]
+    pub pan_x: f32,
+    /// Vertical pan in display pixels.
+    #[serde(default)]
+    pub pan_y: f32,
+    /// Additional horizontal scale after fit and zoom.
+    #[serde(default = "default_background_stretch")]
+    pub stretch_x: f32,
+    /// Additional vertical scale after fit and zoom.
+    #[serde(default = "default_background_stretch")]
+    pub stretch_y: f32,
+    /// Background-only rotation in degrees. Widget and device rotation are separate.
+    #[serde(default)]
+    pub rotation: f32,
     /// Image opacity before the darken overlay is applied.
     #[serde(default = "default_background_opacity")]
     pub opacity: u8,
@@ -143,6 +218,11 @@ impl Default for BackgroundConfig {
             zoom: 1.0,
             offset_x: 0.0,
             offset_y: 0.0,
+            pan_x: 0.0,
+            pan_y: 0.0,
+            stretch_x: 1.0,
+            stretch_y: 1.0,
+            rotation: 0.0,
             opacity: 255,
             background_color: default_background_color(),
             blur_sigma: 0.0,
@@ -539,8 +619,9 @@ impl Config {
     /// loaded one (forward migration) and saves the result so the GUI sees them too.
     pub fn load(path: &PathBuf) -> anyhow::Result<Self> {
         let text = fs::read_to_string(path)?;
+        let source: toml::Value = toml::from_str(&text).map_err(|e| anyhow::anyhow!(e))?;
         let mut config: Self = toml::from_str(&text).map_err(|e| anyhow::anyhow!(e))?;
-        if config.migrate_sensors() {
+        if config.migrate_sensors() || config.migrate_background_transforms(&source) {
             let _ = config.save(path);
         }
         Ok(config)
@@ -558,6 +639,24 @@ impl Config {
             }
         }
         added
+    }
+
+    // Convert original normalized offsets to pixel pan values once.
+    fn migrate_background_transforms(&mut self, source: &toml::Value) -> bool {
+        let Some(background) = source.get("background").and_then(toml::Value::as_table) else {
+            return false;
+        };
+        if background.contains_key("pan_x") || background.contains_key("pan_y") {
+            return false;
+        }
+        if !background.contains_key("offset_x") && !background.contains_key("offset_y") {
+            return false;
+        }
+        self.background.pan_x = self.background.offset_x * 240.0;
+        self.background.pan_y = self.background.offset_y * 240.0;
+        self.background.offset_x = 0.0;
+        self.background.offset_y = 0.0;
+        true
     }
 
     pub fn save(&self, path: &PathBuf) -> anyhow::Result<()> {
@@ -951,5 +1050,27 @@ mod tests {
             cfg.sensor_by_id("igpu_temp").is_some(),
             "missing sensor must be added"
         );
+    }
+    #[test]
+    fn background_offset_migration_converts_to_pixels() {
+        let mut config = Config::default();
+        config.background.offset_x = 0.5;
+        config.background.offset_y = -0.25;
+        let source: toml::Value =
+            toml::from_str("[background]\noffset_x = 0.5\noffset_y = -0.25").unwrap();
+        assert!(config.migrate_background_transforms(&source));
+        assert_eq!(config.background.pan_x, 120.0);
+        assert_eq!(config.background.pan_y, -60.0);
+        assert_eq!(config.background.offset_x, 0.0);
+        assert_eq!(config.background.offset_y, 0.0);
+    }
+
+    #[test]
+    fn background_offset_migration_skips_new_pixel_pan() {
+        let mut config = Config::default();
+        config.background.pan_x = 12.0;
+        let source: toml::Value = toml::from_str("[background]\npan_x = 12.0").unwrap();
+        assert!(!config.migrate_background_transforms(&source));
+        assert_eq!(config.background.pan_x, 12.0);
     }
 }
