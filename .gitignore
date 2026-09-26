@@ -1,4 +1,5 @@
 /target/
+/.patches/
 /CLAUDE.md
 /.claude/
 /.idea/
