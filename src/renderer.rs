@@ -1,6 +1,6 @@
 use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
 use image::codecs::gif::GifDecoder;
-use image::{imageops, AnimationDecoder, Rgb, RgbImage};
+use image::{imageops, AnimationDecoder, Rgb, RgbImage, Rgba, RgbaImage};
 use imageproc::drawing::{draw_filled_circle_mut, draw_line_segment_mut, draw_text_mut};
 use imageproc::geometric_transformations::{rotate_about_center, Interpolation};
 use std::fs::File;
@@ -42,6 +42,8 @@ impl DragSnapState {
     }
 
     pub fn update(&mut self, delta: [f32; 2], snapping: bool, grid: f32) {
+        // egui's Response::drag_delta() is the pointer movement for the current
+        // frame, so preserve the unsnapped accumulator across frames.
         self.raw[0] += delta[0];
         self.raw[1] += delta[1];
         self.moved |= delta[0] != 0.0 || delta[1] != 0.0;
@@ -64,11 +66,90 @@ impl DragSnapState {
 }
 
 pub fn snap_value(value: f32, grid: f32) -> f32 {
-    if grid <= 0.0 {
+    if !grid.is_finite() || grid <= 0.0 || !value.is_finite() {
         value
     } else {
         (value / grid).round() * grid
     }
+}
+
+pub fn centered_grid_coordinates(grid: f32) -> Vec<f32> {
+    if !grid.is_finite() || grid <= 0.0 {
+        return vec![240.0];
+    }
+    let mut coordinates = vec![240.0];
+    let mut offset = grid;
+    while offset <= 240.0 + f32::EPSILON {
+        coordinates.push(240.0 - offset);
+        coordinates.push(240.0 + offset);
+        offset += grid;
+    }
+    coordinates.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    coordinates
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RotationDragState {
+    pub origin: f32,
+    pub raw: f32,
+    pub preview: f32,
+    last_pointer_angle: f32,
+    moved: bool,
+}
+
+impl RotationDragState {
+    pub fn new(origin: f32, pointer_angle: f32) -> Self {
+        Self {
+            origin,
+            raw: origin,
+            preview: origin,
+            last_pointer_angle: pointer_angle,
+            moved: false,
+        }
+    }
+
+    pub fn update(&mut self, pointer_angle: f32, snapping: bool, step: f32) {
+        let delta = normalize_angle(pointer_angle - self.last_pointer_angle);
+        self.last_pointer_angle = pointer_angle;
+        self.moved |= delta.abs() > f32::EPSILON;
+        self.raw += delta;
+        self.preview = normalize_angle(if snapping {
+            snap_value(self.raw, step)
+        } else {
+            self.raw
+        });
+    }
+
+    pub fn finish(self, snapping: bool, step: f32) -> f32 {
+        if !self.moved {
+            self.origin
+        } else {
+            normalize_angle(if snapping {
+                snap_value(self.raw, step)
+            } else {
+                self.raw
+            })
+        }
+    }
+}
+
+pub fn normalize_angle(angle: f32) -> f32 {
+    let normalized = (angle + 180.0).rem_euclid(360.0) - 180.0;
+    if normalized == -180.0 && angle > 0.0 {
+        180.0
+    } else {
+        normalized
+    }
+}
+
+pub fn arc_pointer_angle(
+    pointer: [f32; 2],
+    center: [f32; 2],
+    dead_zone_radius: f32,
+) -> Option<f32> {
+    let dx = pointer[0] - center[0];
+    let dy = pointer[1] - center[1];
+    (dx * dx + dy * dy >= dead_zone_radius.max(0.0).powi(2)).then(|| dy.atan2(dx).to_degrees())
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -101,7 +182,6 @@ enum AnimatedSource {
 
 pub struct TimedAnimation {
     frames: Vec<(RgbImage, Duration)>,
-    total: Duration,
     started: Instant,
 }
 
@@ -109,7 +189,6 @@ impl TimedAnimation {
     pub fn load_gif(path: &Path) -> Result<Self, String> {
         let decoder = GifDecoder::new(BufReader::new(File::open(path).map_err(|e| e.to_string())?))
             .map_err(|e| e.to_string())?;
-        let mut total = Duration::ZERO;
         let frames = decoder
             .into_frames()
             .collect_frames()
@@ -123,7 +202,6 @@ impl TimedAnimation {
                     Duration::from_secs_f64(f64::from(numerator) / f64::from(denominator) / 1000.0)
                 }
                 .max(Duration::from_millis(10));
-                total += delay;
                 (
                     image::DynamicImage::ImageRgba8(frame.into_buffer()).into_rgb8(),
                     delay,
@@ -135,22 +213,39 @@ impl TimedAnimation {
         }
         Ok(Self {
             frames,
-            total,
             started: Instant::now(),
         })
     }
 
-    pub fn current_frame(&self) -> &RgbImage {
-        let elapsed = self.started.elapsed().as_secs_f64() % self.total.as_secs_f64();
-        let mut accumulated = 0.0;
-        let index = self
-            .frames
+    pub fn frame_count(&self) -> usize {
+        self.frames.len()
+    }
+
+    pub fn frame(&self, index: usize) -> Option<&RgbImage> {
+        self.frames.get(index).map(|(frame, _)| frame)
+    }
+
+    pub fn frame_start_seconds(&self, index: usize) -> f64 {
+        self.frames
             .iter()
-            .position(|(_, delay)| {
-                accumulated += delay.as_secs_f64();
-                elapsed < accumulated
-            })
-            .unwrap_or(self.frames.len() - 1);
+            .take(index.min(self.frames.len()))
+            .map(|(_, delay)| delay.as_secs_f64())
+            .sum()
+    }
+
+    pub fn first_delay_ms(&self) -> u32 {
+        self.frames
+            .first()
+            .map(|(_, delay)| delay.as_millis().clamp(80, u128::from(u32::MAX)) as u32)
+            .unwrap_or(100)
+    }
+
+    pub fn current_uniform_frame(&self, start: usize, end: usize, delay_ms: u32) -> &RgbImage {
+        let start = start.min(self.frames.len() - 1);
+        let end = end.clamp(start, self.frames.len() - 1);
+        let count = end - start + 1;
+        let elapsed_ms = self.started.elapsed().as_millis();
+        let index = start + (elapsed_ms / u128::from(delay_ms.max(1)) % count as u128) as usize;
         &self.frames[index].0
     }
 }
@@ -247,13 +342,7 @@ impl AnimatedSource {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
-            .map_err(|error| {
-                if error.kind() == std::io::ErrorKind::NotFound {
-                    "This media type requires FFmpeg. Install ffmpeg and try again.".to_string()
-                } else {
-                    format!("failed to start FFmpeg: {error}")
-                }
-            })?;
+            .map_err(ffmpeg_start_error)?;
         let stdout = child
             .stdout
             .take()
@@ -492,6 +581,32 @@ impl Renderer {
         self.background_error.take()
     }
 
+    pub fn widget_bounds(
+        &self,
+        config: &Config,
+        instance_id: &str,
+        values: &SensorValues,
+    ) -> Option<[f32; 2]> {
+        let instance = config
+            .widget_instances
+            .iter()
+            .find(|instance| instance.id == instance_id)?;
+        let widget = config.resolved_widget(instance)?;
+        let font = FontRef::try_from_slice(&self.font_bytes).ok()?;
+        let raw = values.readings.get(&widget.source_id).copied();
+        let value = raw
+            .map(|value| format_value(&widget.unit, value))
+            .unwrap_or_else(|| "--".to_string());
+        let [width, height] = widget_layer_dimensions(&font, &widget, &value);
+        let width = width * widget.transform.zoom * widget.transform.stretch_x;
+        let height = height * widget.transform.zoom * widget.transform.stretch_y;
+        let radians = widget.transform.rotation.to_radians();
+        Some([
+            width * radians.cos().abs() + height * radians.sin().abs(),
+            width * radians.sin().abs() + height * radians.cos().abs(),
+        ])
+    }
+
     fn render_base(&self, config: &Config, v: &SensorValues) -> RgbImage {
         let font = FontRef::try_from_slice(&self.font_bytes).expect("invalid font");
 
@@ -524,6 +639,20 @@ impl Renderer {
         // ── Divider line (only in Classic layout) ────────────────────────────
         if config.layout.preset == crate::config::LayoutPreset::Classic {
             draw_line_segment_mut(&mut img, (68.0, 262.0), (412.0, 262.0), DIVIDER);
+        }
+
+        if config.widget_model_version > 0 {
+            for widget in config.resolved_widgets() {
+                if !widget.visible {
+                    continue;
+                }
+                let raw = v.readings.get(&widget.source_id).copied();
+                if raw.is_none() && !widget.style.show_missing {
+                    continue;
+                }
+                draw_widget_instance(&mut img, &font, &widget, raw);
+            }
+            return img;
         }
 
         // ── Sensors ───────────────────────────────────────────────────────────
@@ -567,6 +696,131 @@ impl Renderer {
         }
 
         img
+    }
+}
+
+fn draw_widget_instance(
+    canvas: &mut RgbImage,
+    font: &FontRef,
+    widget: &crate::config::ResolvedWidget,
+    raw: Option<f32>,
+) {
+    let value = raw
+        .map(|value| format_value(&widget.unit, value))
+        .unwrap_or_else(|| "--".to_string());
+    let value_color = raw
+        .map(|value| crate::config::interpolate_color(value, &widget.style.color_map))
+        .unwrap_or([150, 150, 150]);
+    let [logical_width, logical_height] = widget_layer_dimensions(font, widget, &value);
+    let min_y = widget.style.label_offset_y.min(0.0);
+    let width = logical_width.ceil().max(1.0) as u32;
+    let height = logical_height.ceil().max(1.0) as u32;
+    let mut layer = RgbaImage::new(width, height);
+    draw_centered_rgba(
+        &mut layer,
+        font,
+        &value,
+        width as i32 / 2,
+        (4.0 - min_y).round() as i32,
+        widget.style.value_font_size,
+        Rgba([value_color[0], value_color[1], value_color[2], 255]),
+    );
+    draw_centered_rgba(
+        &mut layer,
+        font,
+        &widget.label,
+        (width as f32 / 2.0 + widget.style.label_offset_x).round() as i32,
+        (4.0 + widget.style.label_offset_y - min_y).round() as i32,
+        widget.style.label_font_size,
+        Rgba([
+            widget.style.label_color[0],
+            widget.style.label_color[1],
+            widget.style.label_color[2],
+            255,
+        ]),
+    );
+
+    let transform = widget.transform;
+    let scaled_width = (layer.width() as f32 * transform.zoom * transform.stretch_x)
+        .round()
+        .clamp(1.0, 4096.0) as u32;
+    let scaled_height = (layer.height() as f32 * transform.zoom * transform.stretch_y)
+        .round()
+        .clamp(1.0, 4096.0) as u32;
+    let scaled = imageops::resize(
+        &layer,
+        scaled_width,
+        scaled_height,
+        imageops::FilterType::Lanczos3,
+    );
+    let transformed = rotate_rgba_expanded(&scaled, transform.rotation);
+    let left = (240.0 + transform.pan_x - transformed.width() as f32 / 2.0).round() as i64;
+    let top = (240.0 + transform.pan_y - transformed.height() as f32 / 2.0).round() as i64;
+    overlay_rgba(canvas, &transformed, left, top);
+}
+
+fn widget_layer_dimensions(
+    font: &FontRef,
+    widget: &crate::config::ResolvedWidget,
+    value: &str,
+) -> [f32; 2] {
+    let value_width = measure_width(font, PxScale::from(widget.style.value_font_size), value);
+    let label_width = measure_width(
+        font,
+        PxScale::from(widget.style.label_font_size),
+        &widget.label,
+    );
+    let half_width = (value_width / 2.0).max(widget.style.label_offset_x.abs() + label_width / 2.0);
+    let min_y = widget.style.label_offset_y.min(0.0);
+    let max_y = widget
+        .style
+        .value_font_size
+        .max(widget.style.label_offset_y + widget.style.label_font_size);
+    [
+        (half_width * 2.0).ceil().max(1.0) + 8.0,
+        (max_y - min_y).ceil().max(1.0) + 8.0,
+    ]
+}
+
+fn rotate_rgba_expanded(image: &RgbaImage, degrees: f32) -> RgbaImage {
+    if degrees.abs() <= 0.01 {
+        return image.clone();
+    }
+    let diagonal = ((image.width() as f32).hypot(image.height() as f32))
+        .ceil()
+        .max(1.0) as u32;
+    let mut padded = RgbaImage::new(diagonal, diagonal);
+    imageops::overlay(
+        &mut padded,
+        image,
+        (diagonal as i64 - image.width() as i64) / 2,
+        (diagonal as i64 - image.height() as i64) / 2,
+    );
+    rotate_about_center(
+        &padded,
+        degrees.to_radians(),
+        Interpolation::Bilinear,
+        Rgba([0, 0, 0, 0]),
+    )
+}
+
+fn overlay_rgba(canvas: &mut RgbImage, layer: &RgbaImage, left: i64, top: i64) {
+    for (x, y, pixel) in layer.enumerate_pixels() {
+        let cx = left + x as i64;
+        let cy = top + y as i64;
+        if cx < 0 || cy < 0 || cx >= canvas.width() as i64 || cy >= canvas.height() as i64 {
+            continue;
+        }
+        let alpha = pixel[3] as f32 / 255.0;
+        if alpha <= 0.0 {
+            continue;
+        }
+        let target = canvas.get_pixel_mut(cx as u32, cy as u32);
+        for channel in 0..3 {
+            target[channel] = (pixel[channel] as f32 * alpha
+                + target[channel] as f32 * (1.0 - alpha))
+                .round() as u8;
+        }
     }
 }
 
@@ -700,13 +954,21 @@ pub fn load_media_frame_at(path: &Path, seconds: f64) -> Result<RgbImage, String
             "pipe:1",
         ])
         .output()
-        .map_err(|error| format!("failed to run FFmpeg: {error}"))?;
+        .map_err(ffmpeg_start_error)?;
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
     image::load_from_memory(&output.stdout)
         .map(|image| image.into_rgb8())
         .map_err(|error| error.to_string())
+}
+
+fn ffmpeg_start_error(error: std::io::Error) -> String {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        "This media type requires FFmpeg. Install ffmpeg and try again.".to_string()
+    } else {
+        format!("failed to start FFmpeg: {error}")
+    }
 }
 
 /// Transform one decoded frame into the 480x480 background canvas.
@@ -758,21 +1020,56 @@ fn prepare_transform_geometry(
             (sw as f32 * scale, sh as f32 * scale)
         }
         ImageFit::Stretch => (W as f32 * zoom, H as f32 * zoom),
+        ImageFit::Native => (sw as f32 * zoom, sh as f32 * zoom),
     };
     let nw = (base_w * stretch_x).round().clamp(1.0, 8192.0) as u32;
     let nh = (base_h * stretch_y).round().clamp(1.0, 8192.0) as u32;
     let scaled = imageops::resize(src, nw, nh, imageops::FilterType::Lanczos3);
     let canvas_color = Rgb(canvas_color);
     Some(if transform.rotation.abs() > 0.01 {
-        rotate_about_center(
-            &scaled,
-            transform.rotation.to_radians(),
-            Interpolation::Bilinear,
-            canvas_color,
-        )
+        rotate_with_expanded_bounds(&scaled, transform.rotation, canvas_color)
     } else {
         scaled
     })
+}
+
+/// Rotate without clipping against the source image's unrotated rectangle.
+///
+/// `imageproc::rotate_about_center` preserves its input dimensions, so rotating
+/// a non-square image directly would discard the parts which extend beyond the
+/// original bounds. Padding to the rotated bounding box first gives the output
+/// enough room while retaining the same center pivot used by pan/composition.
+fn rotate_with_expanded_bounds(image: &RgbImage, degrees: f32, fill: Rgb<u8>) -> RgbImage {
+    let radians = degrees.to_radians();
+    let sin = radians.sin().abs();
+    let cos = radians.cos().abs();
+    let width = image.width() as f32;
+    let height = image.height() as f32;
+    let bound_dimension = |value: f32| {
+        let rounded = value.round();
+        let dimension = if (value - rounded).abs() < 0.001 {
+            rounded
+        } else {
+            value.ceil()
+        };
+        dimension.max(1.0) as u32
+    };
+    let rotated_width = bound_dimension(width * cos + height * sin);
+    let rotated_height = bound_dimension(width * sin + height * cos);
+
+    // The input must fit before rotation as well as after it. For rotations near
+    // 90 degrees, the final bounding dimensions are effectively swapped, so
+    // padding directly to only the final dimensions would clip while copying.
+    let padded_width = rotated_width.max(image.width());
+    let padded_height = rotated_height.max(image.height());
+    let mut padded = RgbImage::from_pixel(padded_width, padded_height, fill);
+    let x = (padded_width as i64 - image.width() as i64) / 2;
+    let y = (padded_height as i64 - image.height() as i64) / 2;
+    imageops::overlay(&mut padded, image, x, y);
+    let rotated = rotate_about_center(&padded, radians, Interpolation::Bilinear, fill);
+    let crop_x = (padded_width - rotated_width) / 2;
+    let crop_y = (padded_height - rotated_height) / 2;
+    imageops::crop_imm(&rotated, crop_x, crop_y, rotated_width, rotated_height).to_image()
 }
 
 fn compose_background_image(prepared: &RgbImage, config: &BackgroundConfig) -> RgbImage {
@@ -841,6 +1138,21 @@ fn draw_centered(
     y_top: i32,
     size: f32,
     color: Rgb<u8>,
+) {
+    let scale = PxScale::from(size);
+    let width = measure_width(font, scale, text);
+    let x = cx - (width / 2.0) as i32;
+    draw_text_mut(img, color, x, y_top, scale, font, text);
+}
+
+fn draw_centered_rgba(
+    img: &mut RgbaImage,
+    font: &FontRef,
+    text: &str,
+    cx: i32,
+    y_top: i32,
+    size: f32,
+    color: Rgba<u8>,
 ) {
     let scale = PxScale::from(size);
     let width = measure_width(font, scale, text);
@@ -1137,6 +1449,101 @@ mod tests {
     }
 
     #[test]
+    fn rotation_expands_non_square_bounds_instead_of_clipping() {
+        let source = RgbImage::from_pixel(120, 300, Rgb([240, 10, 20]));
+        let rotated = rotate_with_expanded_bounds(&source, 90.0, Rgb([0, 0, 0]));
+
+        assert_eq!((rotated.width(), rotated.height()), (300, 120));
+        let retained_source_pixels = rotated
+            .pixels()
+            .filter(|pixel| pixel[0] > 200 && pixel[1] < 30 && pixel[2] < 30)
+            .count();
+        assert!(
+            retained_source_pixels > 35_000,
+            "retained {retained_source_pixels} of 36000 source pixels"
+        );
+    }
+
+    #[test]
+    fn shared_rotation_keeps_center_pivot_and_clips_to_canvas() {
+        let canvas = [2, 4, 6];
+        let mut source = RgbImage::from_pixel(120, 60, Rgb([200, 20, 30]));
+        source.put_pixel(60, 30, Rgb([0, 255, 0]));
+        let media = MediaTransform {
+            fit: ImageFit::Native,
+            transform: Transform2D {
+                rotation: 45.0,
+                ..Default::default()
+            },
+            canvas_color: canvas,
+        };
+
+        let rendered = transform_media_image(&source, &media).unwrap();
+        assert_eq!((rendered.width(), rendered.height()), (480, 480));
+        assert_ne!(rendered.get_pixel(240, 240), &Rgb(canvas));
+        for corner in [(0, 0), (479, 0), (0, 479), (479, 479)] {
+            assert_eq!(rendered.get_pixel(corner.0, corner.1), &Rgb(canvas));
+        }
+    }
+
+    #[test]
+    fn native_transform_exposes_canvas_fill_around_source() {
+        let source = RgbImage::from_pixel(20, 10, Rgb([200, 100, 50]));
+        let media = MediaTransform {
+            fit: ImageFit::Native,
+            transform: Transform2D::default(),
+            canvas_color: [7, 11, 13],
+        };
+        let rendered = transform_media_image(&source, &media).unwrap();
+        assert_eq!(rendered.get_pixel(0, 0), &Rgb([7, 11, 13]));
+        assert_eq!(rendered.get_pixel(240, 240), &Rgb([200, 100, 50]));
+    }
+
+    #[test]
+    fn background_cache_invalidates_only_the_affected_layer() {
+        let path = std::env::temp_dir().join(format!(
+            "th420-transform-cache-{}-{:?}.png",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        RgbImage::from_pixel(24, 12, Rgb([90, 120, 150]))
+            .save(&path)
+            .unwrap();
+        let mut config = Config::default();
+        config.background.image_path = Some(path.to_string_lossy().into_owned());
+        config.background.fit = ImageFit::Native;
+        config.background.overlay_alpha = 0;
+        let mut renderer = Renderer::new();
+
+        renderer.update_bg_cache(&config);
+        let original_geometry = renderer.bg_geometry_cache.as_ref().unwrap().clone();
+        let original_composed = renderer.bg_cache.as_ref().unwrap().1.clone();
+
+        config.background.pan_x = 40.0;
+        renderer.update_bg_cache(&config);
+        assert_eq!(
+            renderer.bg_geometry_cache.as_ref().unwrap(),
+            &original_geometry
+        );
+        assert_ne!(renderer.bg_cache.as_ref().unwrap().1, original_composed);
+
+        config.background.background_color = [1, 2, 3];
+        renderer.update_bg_cache(&config);
+        assert_ne!(
+            renderer.bg_geometry_cache.as_ref().unwrap().0,
+            original_geometry.0
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn missing_ffmpeg_error_identifies_optional_dependency() {
+        let message = ffmpeg_start_error(std::io::Error::from(std::io::ErrorKind::NotFound));
+        assert!(message.contains("requires FFmpeg"));
+        assert!(message.contains("Install ffmpeg"));
+    }
+
+    #[test]
     fn media_and_background_adapters_share_transform_geometry() {
         let source = RgbImage::from_fn(120, 80, |x, y| {
             Rgb([(x % 255) as u8, (y % 255) as u8, ((x + y) % 255) as u8])
@@ -1173,6 +1580,66 @@ mod tests {
         assert_eq!(boot.preview, [8.0, 8.0]);
         assert_eq!(boot.finish(true, 8.0), [8.0, 8.0]);
         assert_eq!(standby.finish(true, 12.0), [5.5, 7.5]);
+    }
+
+    #[test]
+    fn rotation_drag_unwraps_across_angle_boundary() {
+        let mut drag = RotationDragState::new(0.0, 179.0);
+        drag.update(-179.0, false, 15.0);
+        assert!((drag.raw - 2.0).abs() < 0.001);
+        assert!((drag.preview - 2.0).abs() < 0.001);
+        assert!((drag.finish(false, 15.0) - 2.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn rotation_drag_commits_snapped_normalized_angle() {
+        let mut drag = RotationDragState::new(170.0, 0.0);
+        drag.update(20.0, true, 15.0);
+        assert_eq!(drag.raw, 190.0);
+        assert_eq!(drag.preview, -165.0);
+        let committed = drag.finish(true, 15.0);
+        assert_eq!(committed, -165.0);
+        assert_ne!(committed, snap_value(committed, 30.0));
+    }
+
+    #[test]
+    fn rotation_click_and_target_states_remain_independent() {
+        let background = RotationDragState::new(37.5, 10.0);
+        let mut boot = RotationDragState::new(-10.0, 0.0);
+        let standby = RotationDragState::new(80.0, 90.0);
+        boot.update(32.0, true, 15.0);
+
+        assert_eq!(background.finish(true, 15.0), 37.5);
+        assert_eq!(boot.finish(true, 15.0), 15.0);
+        assert_eq!(standby.finish(false, 1.0), 80.0);
+    }
+
+    #[test]
+    fn rotation_arc_ignores_unstable_center_dead_zone() {
+        assert_eq!(arc_pointer_angle([5.0, 5.0], [5.0, 5.0], 10.0), None);
+        assert_eq!(arc_pointer_angle([15.0, 5.0], [5.0, 5.0], 10.0), Some(0.0));
+        assert_eq!(arc_pointer_angle([5.0, 15.0], [5.0, 5.0], 10.0), Some(90.0));
+    }
+
+    #[test]
+    fn centered_grid_is_symmetric_for_non_divisor_sizes() {
+        for grid in [7.0, 8.0, 12.0, 20.0] {
+            let coordinates = centered_grid_coordinates(grid);
+            assert!(coordinates.contains(&240.0));
+            for coordinate in &coordinates {
+                let mirror = 480.0 - coordinate;
+                assert!(coordinates
+                    .iter()
+                    .any(|other| (other - mirror).abs() < 0.001));
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_grid_values_do_not_create_invalid_snaps() {
+        assert_eq!(snap_value(13.0, f32::NAN), 13.0);
+        assert_eq!(snap_value(13.0, 0.0), 13.0);
+        assert_eq!(centered_grid_coordinates(f32::NAN), [240.0]);
     }
 
     #[test]

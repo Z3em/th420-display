@@ -10,7 +10,8 @@ use config::{default_config_path, Config, ImageFit, MediaTransform, Transform2D}
 use image::codecs::gif::GifDecoder;
 use image::{imageops, AnimationDecoder};
 use instance::{
-    replace_and_acquire, AcquireError, DeviceGuard, InstanceGuard, InstanceKind, ReplaceExisting,
+    current_owner, replace_and_acquire_daemon, request_daemon_command, AcquireError, DaemonControl,
+    DeviceGuard, InstanceGuard, InstanceKind, ReplaceExisting,
 };
 use jpeg_encoder::{ColorType as JpegColorType, Encoder as JpegEncoder, SamplingFactor};
 use std::fs::File;
@@ -23,6 +24,14 @@ use std::time::{Duration, Instant, SystemTime};
 
 // Observed in the reverse-engineered official Windows application.
 const MAX_BOOT_CONTAINER_SIZE: usize = 10 * 1024 * 1024;
+const MIN_BOOT_FRAME_DELAY_MS: u32 = 80;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BootEdit {
+    start_frame: usize,
+    end_frame: Option<usize>,
+    frame_delay_ms: Option<u32>,
+}
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum PumpTempOverlay {
@@ -30,11 +39,19 @@ enum PumpTempOverlay {
     Hide,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum DaemonControlArg {
+    Pause,
+    Resume,
+    State,
+}
+
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum MediaFitArg {
     Cover,
     Contain,
     Stretch,
+    Native,
 }
 
 impl From<MediaFitArg> for ImageFit {
@@ -43,6 +60,7 @@ impl From<MediaFitArg> for ImageFit {
             MediaFitArg::Cover => Self::Cover,
             MediaFitArg::Contain => Self::Contain,
             MediaFitArg::Stretch => Self::Stretch,
+            MediaFitArg::Native => Self::Native,
         }
     }
 }
@@ -62,6 +80,10 @@ struct Cli {
     /// Replace an existing live daemon, escalating no further than this level.
     #[arg(long, value_enum, value_name = "graceful|term|kill")]
     replace_existing: Option<ReplaceExisting>,
+
+    /// Control device ownership of the running daemon.
+    #[arg(long, value_enum, value_name = "pause|resume|state")]
+    daemon_control: Option<DaemonControlArg>,
 
     /// Sensor update interval in milliseconds
     #[arg(short, long, default_value = "800")]
@@ -98,6 +120,18 @@ struct Cli {
     /// Prepare and report boot-container metadata without opening the device.
     #[arg(long, value_name = "GIF")]
     inspect_boot: Option<PathBuf>,
+
+    /// First boot-animation frame to include (zero-based).
+    #[arg(long, default_value_t = 0)]
+    boot_start_frame: usize,
+
+    /// Last boot-animation frame to include (zero-based, inclusive).
+    #[arg(long)]
+    boot_end_frame: Option<usize>,
+
+    /// Override source timing with one uniform boot-animation frame delay.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(80..))]
+    boot_frame_delay_ms: Option<u32>,
 
     /// Stream IMAGE frames through the live display endpoint, then exit.
     #[arg(long, value_name = "IMAGE", num_args = 1..)]
@@ -204,9 +238,13 @@ fn encode_rgb_jpeg(source: image::RgbImage) -> Result<Vec<u8>> {
     Ok(encoded.into_inner())
 }
 
-fn decode_gif(path: &Path, transform: &MediaTransform) -> Result<Vec<(Vec<u8>, Duration)>> {
+fn decode_gif(
+    path: &Path,
+    transform: &MediaTransform,
+    edit: BootEdit,
+) -> Result<Vec<(Vec<u8>, Duration)>> {
     let decoder = GifDecoder::new(BufReader::new(File::open(path)?))?;
-    decoder
+    let frames = decoder
         .into_frames()
         .collect_frames()?
         .into_iter()
@@ -222,7 +260,19 @@ fn decode_gif(path: &Path, transform: &MediaTransform) -> Result<Vec<(Vec<u8>, D
                 .ok_or_else(|| anyhow::anyhow!("media frame is empty"))?;
             Ok((encode_rgb_jpeg(transformed)?, delay))
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    let range = boot_frame_range(frames.len(), edit)?;
+    Ok(frames[range]
+        .iter()
+        .map(|(frame, source_delay)| {
+            (
+                frame.clone(),
+                edit.frame_delay_ms
+                    .map(|delay| Duration::from_millis(u64::from(delay)))
+                    .unwrap_or(*source_delay),
+            )
+        })
+        .collect())
 }
 
 fn encode_boot_jpeg(source: image::RgbImage) -> Result<Vec<u8>> {
@@ -234,26 +284,56 @@ fn encode_boot_jpeg(source: image::RgbImage) -> Result<Vec<u8>> {
     Ok(encoded)
 }
 
-fn decode_boot_gif(path: &Path, transform: &MediaTransform) -> Result<(Vec<Vec<u8>>, u32)> {
-    let decoder = GifDecoder::new(BufReader::new(File::open(path)?))?;
-    let mut frame_delay_ms = None;
-    let mut frames = Vec::new();
+fn boot_frame_range(frame_count: usize, edit: BootEdit) -> Result<std::ops::Range<usize>> {
+    if frame_count == 0 {
+        bail!("boot GIF has no frames");
+    }
+    let end = edit.end_frame.unwrap_or(frame_count - 1);
+    if edit.start_frame >= frame_count || end >= frame_count {
+        bail!("boot frame range is outside the source animation");
+    }
+    if edit.start_frame > end {
+        bail!("boot start frame must not be after the end frame");
+    }
+    if edit
+        .frame_delay_ms
+        .is_some_and(|delay| delay < MIN_BOOT_FRAME_DELAY_MS)
+    {
+        bail!("boot frame delay must be at least 80 ms");
+    }
+    Ok(edit.start_frame..end + 1)
+}
 
-    for frame in decoder.into_frames().collect_frames()? {
+fn decode_boot_gif(
+    path: &Path,
+    transform: &MediaTransform,
+    edit: BootEdit,
+) -> Result<(Vec<Vec<u8>>, u32)> {
+    let decoder = GifDecoder::new(BufReader::new(File::open(path)?))?;
+    let source_frames = decoder.into_frames().collect_frames()?;
+    let range = boot_frame_range(source_frames.len(), edit)?;
+    let mut source_delay_ms = None;
+    let mut frames = Vec::with_capacity(range.len());
+
+    for frame in source_frames
+        .into_iter()
+        .skip(range.start)
+        .take(range.len())
+    {
         let (numerator, denominator) = frame.delay().numer_denom_ms();
         if denominator == 0 || numerator % denominator != 0 {
             bail!("boot GIF frame delays must be an exact number of milliseconds");
         }
         let delay_ms = numerator / denominator;
-        if delay_ms < 80 {
+        if edit.frame_delay_ms.is_none() && delay_ms < MIN_BOOT_FRAME_DELAY_MS {
             bail!("boot GIF frame delay must be at least 80 ms");
         }
-        if let Some(expected) = frame_delay_ms {
-            if delay_ms != expected {
+        if let Some(expected) = source_delay_ms {
+            if edit.frame_delay_ms.is_none() && delay_ms != expected {
                 bail!("boot GIF must use one uniform frame delay");
             }
         } else {
-            frame_delay_ms = Some(delay_ms);
+            source_delay_ms = Some(delay_ms);
         }
 
         let rgb = image::DynamicImage::ImageRgba8(frame.into_buffer()).into_rgb8();
@@ -264,7 +344,9 @@ fn decode_boot_gif(path: &Path, transform: &MediaTransform) -> Result<(Vec<Vec<u
 
     Ok((
         frames,
-        frame_delay_ms.ok_or_else(|| anyhow::anyhow!("boot GIF has no frames"))?,
+        edit.frame_delay_ms
+            .or(source_delay_ms)
+            .ok_or_else(|| anyhow::anyhow!("boot GIF has no frames"))?,
     ))
 }
 
@@ -274,6 +356,19 @@ fn validate_cli(cli: &Cli) -> Result<()> {
     }
     if cli.pump_temp_color.is_some() && cli.upload_standby.is_none() {
         bail!("--pump-temp-color requires --upload-standby to commit the color");
+    }
+    if cli.daemon_control.is_some()
+        && (cli.status
+            || cli.upload_standby.is_some()
+            || cli.standby_brightness.is_some()
+            || cli.pump_temp_color.is_some()
+            || cli.pump_temp_overlay.is_some()
+            || cli.upload_boot.is_some()
+            || cli.inspect_boot.is_some()
+            || !cli.play_live_frames.is_empty()
+            || cli.play_live_gif.is_some())
+    {
+        bail!("daemon control cannot be combined with display operations");
     }
     if cli.status
         && (cli.upload_standby.is_some()
@@ -333,13 +428,32 @@ impl Cli {
             || self.inspect_boot.is_some()
             || !self.play_live_frames.is_empty()
             || self.play_live_gif.is_some()
+            || self.daemon_control.is_some()
     }
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
     validate_cli(&cli)?;
+    if let Some(command) = cli.daemon_control {
+        let command = match command {
+            DaemonControlArg::Pause => "pause",
+            DaemonControlArg::Resume => "resume",
+            DaemonControlArg::State => "state",
+        };
+        let owner = current_owner(InstanceKind::Daemon)
+            .ok_or_else(|| anyhow::anyhow!("the live daemon is not running"))?;
+        let state = request_daemon_command(&owner, command, Duration::from_secs(5))
+            .map_err(anyhow::Error::msg)?;
+        println!("daemon_state={state}");
+        return Ok(());
+    }
     let media_transform = media_transform(&cli)?;
+    let boot_edit = BootEdit {
+        start_frame: cli.boot_start_frame,
+        end_frame: cli.boot_end_frame,
+        frame_delay_ms: cli.boot_frame_delay_ms,
+    };
     let interval = Duration::from_millis(cli.interval);
     let config_path = cli.config.unwrap_or_else(default_config_path);
 
@@ -355,7 +469,7 @@ fn main() -> Result<()> {
     }
 
     if let Some(path) = cli.inspect_boot {
-        let (frames, frame_delay_ms) = decode_boot_gif(&path, &media_transform)?;
+        let (frames, frame_delay_ms) = decode_boot_gif(&path, &media_transform, boot_edit)?;
         let container = device::build_boot_container(&frames)?;
         println!("boot_frames={}", frames.len());
         println!("boot_delay_ms={frame_delay_ms}");
@@ -369,7 +483,7 @@ fn main() -> Result<()> {
     }
 
     if let Some(path) = cli.upload_boot {
-        let (frames, frame_delay_ms) = decode_boot_gif(&path, &media_transform)?;
+        let (frames, frame_delay_ms) = decode_boot_gif(&path, &media_transform, boot_edit)?;
         let container = device::build_boot_container(&frames)?;
         if container.len() > MAX_BOOT_CONTAINER_SIZE {
             bail!("boot container exceeds the 10 MB vendor-app limit");
@@ -391,7 +505,7 @@ fn main() -> Result<()> {
     }
 
     if let Some(path) = cli.play_live_gif {
-        let frames = decode_gif(&path, &media_transform)?;
+        let frames = decode_gif(&path, &media_transform, boot_edit)?;
         if frames.is_empty() {
             bail!("GIF contains no frames");
         }
@@ -507,11 +621,13 @@ fn main() -> Result<()> {
     }
 
     let shutdown_requested = Arc::new(AtomicBool::new(false));
+    let daemon_control = DaemonControl::new_starting();
     let _instance_guard = if let Some(level) = cli.replace_existing {
-        replace_and_acquire(InstanceKind::Daemon, shutdown_requested.clone(), level)
+        replace_and_acquire_daemon(shutdown_requested.clone(), level, daemon_control.clone())
             .map_err(anyhow::Error::msg)?
     } else {
-        match InstanceGuard::try_acquire(InstanceKind::Daemon, shutdown_requested.clone()) {
+        match InstanceGuard::try_acquire_daemon(shutdown_requested.clone(), daemon_control.clone())
+        {
             Ok(guard) => guard,
             Err(AcquireError::Conflict(owner)) => {
                 bail!("the live daemon is already running:\n{}", owner.describe())
@@ -519,7 +635,7 @@ fn main() -> Result<()> {
             Err(AcquireError::Other(error)) => bail!("{error}"),
         }
     };
-    let _device_guard = DeviceGuard::acquire().map_err(anyhow::Error::msg)?;
+    let mut device_guard = Some(DeviceGuard::acquire().map_err(anyhow::Error::msg)?);
 
     let mut cfg = Config::load(&config_path).unwrap_or_else(|_| {
         let default = Config::default();
@@ -531,24 +647,66 @@ fn main() -> Result<()> {
     println!("Config: {}", config_path.display());
     println!("Opening Thermaltake TH420 V2...");
 
-    let mut dev = device::Device::open()?;
-    dev.init()?;
+    let mut initial_device = device::Device::open()?;
+    initial_device.init()?;
     // Brightness is persistent on the device.  Set it once before the live
     // stream so the control endpoint is reserved for the coolant query below.
     // Re-sending brightness for every frame can leave an ACK queued, which
     // would then be mistaken for a temperature response on the next tick.
-    dev.set_brightness(100)?;
+    initial_device.set_brightness(100)?;
+    let mut dev = Some(initial_device);
+    if !daemon_control.pause_requested() {
+        daemon_control.mark_running();
+    }
     println!("Device ready. Displaying stats (Ctrl+C to stop).");
 
     let mut sensors = sensors::SensorReader::new();
     let mut renderer = renderer::Renderer::new();
     let mut values = sensors.read();
-    values
-        .readings
-        .insert("coolant".to_string(), dev.read_liquid_temp().unwrap_or(0.0));
+    values.readings.insert(
+        "coolant".to_string(),
+        dev.as_mut().unwrap().read_liquid_temp().unwrap_or(0.0),
+    );
     let mut last_sensor_update = Instant::now();
+    let mut daemon_is_paused = false;
 
     while !shutdown_requested.load(Ordering::SeqCst) {
+        if daemon_control.pause_requested() {
+            if !daemon_is_paused {
+                dev.take();
+                device_guard.take();
+                daemon_is_paused = true;
+                daemon_control.mark_paused();
+                println!("Device preview pause active.");
+            }
+            while daemon_control.pause_requested() && !shutdown_requested.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            if shutdown_requested.load(Ordering::SeqCst) {
+                break;
+            }
+            match DeviceGuard::acquire()
+                .map_err(anyhow::Error::msg)
+                .and_then(|guard| {
+                    let mut reopened = device::Device::open()?;
+                    reopened.init()?;
+                    reopened.set_brightness(100)?;
+                    Ok((guard, reopened))
+                }) {
+                Ok((guard, reopened)) => {
+                    device_guard = Some(guard);
+                    dev = Some(reopened);
+                    daemon_is_paused = false;
+                    daemon_control.mark_running();
+                    last_sensor_update = Instant::now() - interval;
+                    println!("Device preview pause ended.");
+                }
+                Err(error) => {
+                    daemon_control.mark_resume_failed(error.to_string());
+                    continue;
+                }
+            }
+        }
         let tick = Instant::now();
 
         // Reload config if file changed
@@ -563,20 +721,24 @@ fn main() -> Result<()> {
 
         if last_sensor_update.elapsed() >= interval {
             values = sensors.read();
-            values
-                .readings
-                .insert("coolant".to_string(), dev.read_liquid_temp().unwrap_or(0.0));
+            values.readings.insert(
+                "coolant".to_string(),
+                dev.as_mut().unwrap().read_liquid_temp().unwrap_or(0.0),
+            );
             last_sensor_update = Instant::now();
         }
 
         let jpeg = renderer.render(&cfg, &values);
-        dev.send_frame_data(&jpeg)?;
+        dev.as_mut().unwrap().send_frame_data(&jpeg)?;
 
         let frame_interval = renderer.animation_frame_interval().unwrap_or(interval);
         let elapsed = tick.elapsed();
         if elapsed < frame_interval {
             let deadline = Instant::now() + (frame_interval - elapsed);
-            while Instant::now() < deadline && !shutdown_requested.load(Ordering::SeqCst) {
+            while Instant::now() < deadline
+                && !shutdown_requested.load(Ordering::SeqCst)
+                && !daemon_control.pause_requested()
+            {
                 std::thread::sleep(
                     deadline
                         .saturating_duration_since(Instant::now())
@@ -596,6 +758,7 @@ mod tests {
     fn cli() -> Cli {
         Cli {
             replace_existing: None,
+            daemon_control: None,
             interval: 800,
             config: None,
             status: false,
@@ -605,6 +768,9 @@ mod tests {
             pump_temp_overlay: None,
             upload_boot: None,
             inspect_boot: None,
+            boot_start_frame: 0,
+            boot_end_frame: None,
+            boot_frame_delay_ms: None,
             play_live_frames: vec![],
             play_live_gif: None,
             live_fps: 24,
@@ -723,10 +889,105 @@ mod tests {
     }
 
     #[test]
+    fn boot_frame_range_is_inclusive_and_validated() {
+        let edit = BootEdit {
+            start_frame: 2,
+            end_frame: Some(4),
+            frame_delay_ms: Some(100),
+        };
+        assert_eq!(boot_frame_range(8, edit).unwrap(), 2..5);
+
+        assert!(boot_frame_range(
+            8,
+            BootEdit {
+                start_frame: 5,
+                end_frame: Some(4),
+                frame_delay_ms: Some(100),
+            }
+        )
+        .is_err());
+        assert!(boot_frame_range(
+            8,
+            BootEdit {
+                start_frame: 0,
+                end_frame: None,
+                frame_delay_ms: Some(79),
+            }
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn boot_decode_applies_trim_and_uniform_timing() {
+        use image::codecs::gif::GifEncoder;
+        use image::{Delay, Frame, Rgba, RgbaImage};
+
+        let path = std::env::temp_dir().join(format!(
+            "th420-boot-edit-{}-{:?}.gif",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let file = File::create(&path).unwrap();
+        let mut encoder = GifEncoder::new(file);
+        for (red, delay) in [(10, 80), (20, 90), (30, 100), (40, 110)] {
+            encoder
+                .encode_frame(Frame::from_parts(
+                    RgbaImage::from_pixel(2, 2, Rgba([red, 0, 0, 255])),
+                    0,
+                    0,
+                    Delay::from_numer_denom_ms(delay, 1),
+                ))
+                .unwrap();
+        }
+        drop(encoder);
+
+        let (frames, delay) = decode_boot_gif(
+            &path,
+            &MediaTransform::default(),
+            BootEdit {
+                start_frame: 1,
+                end_frame: Some(2),
+                frame_delay_ms: Some(125),
+            },
+        )
+        .unwrap();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(delay, 125);
+
+        let preview_frames = decode_gif(
+            &path,
+            &MediaTransform::default(),
+            BootEdit {
+                start_frame: 1,
+                end_frame: Some(2),
+                frame_delay_ms: Some(125),
+            },
+        )
+        .unwrap();
+        assert_eq!(preview_frames.len(), frames.len());
+        assert!(preview_frames
+            .iter()
+            .all(|(_, delay)| *delay == Duration::from_millis(125)));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn replacement_is_rejected_for_one_shot_commands() {
         let mut options = cli();
         options.replace_existing = Some(ReplaceExisting::Kill);
         options.status = true;
+        assert!(validate_cli(&options).is_err());
+    }
+
+    #[test]
+    fn daemon_control_is_a_one_shot_exclusive_operation() {
+        let options = Cli::try_parse_from(["th420-display", "--daemon-control", "pause"]).unwrap();
+        assert_eq!(options.daemon_control, Some(DaemonControlArg::Pause));
+        assert!(options.is_one_shot());
+
+        let mut options = cli();
+        options.daemon_control = Some(DaemonControlArg::State);
+        options.upload_boot = Some("boot.gif".into());
         assert!(validate_cli(&options).is_err());
     }
 

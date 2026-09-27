@@ -91,6 +91,7 @@ pub enum ImageFit {
     Cover,
     Contain,
     Stretch,
+    Native,
 }
 
 /// Reusable canvas-space transform shared by backgrounds and prepared media.
@@ -258,6 +259,105 @@ pub struct LayoutConfig {
     pub preset: LayoutPreset,
     pub max_visible: usize,
     pub custom_slots: Vec<LayoutSlot>,
+}
+
+pub const WIDGET_MODEL_VERSION: u32 = 1;
+pub const BUILTIN_SENSOR_TEMPLATE_ID: &str = "builtin.sensor-value-label";
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct WidgetStyle {
+    pub value_font_size: f32,
+    pub label_font_size: f32,
+    pub label_offset_y: f32,
+    #[serde(default)]
+    pub label_offset_x: f32,
+    pub label_color: [u8; 3],
+    pub color_map: Vec<ColorPoint>,
+    #[serde(default)]
+    pub show_missing: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WidgetKind {
+    #[default]
+    ValueLabel,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct WidgetTemplate {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub built_in: bool,
+    #[serde(default)]
+    pub kind: WidgetKind,
+    pub style: WidgetStyle,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct WidgetOverrides {
+    pub label: Option<String>,
+    pub unit: Option<String>,
+    pub value_font_size: Option<f32>,
+    pub label_font_size: Option<f32>,
+    pub label_offset_y: Option<f32>,
+    pub label_offset_x: Option<f32>,
+    pub label_color: Option<[u8; 3]>,
+    pub color_map: Option<Vec<ColorPoint>>,
+    pub show_missing: Option<bool>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct WidgetInstance {
+    pub id: String,
+    pub name: String,
+    pub template_id: String,
+    pub source_id: String,
+    #[serde(default = "default_true")]
+    pub visible: bool,
+    #[serde(default)]
+    pub transform: Transform2D,
+    #[serde(default)]
+    pub overrides: WidgetOverrides,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResolvedWidget {
+    pub id: String,
+    pub name: String,
+    pub source_id: String,
+    pub visible: bool,
+    pub transform: Transform2D,
+    pub label: String,
+    pub unit: String,
+    pub style: WidgetStyle,
+}
+
+pub fn builtin_sensor_template() -> WidgetTemplate {
+    WidgetTemplate {
+        id: BUILTIN_SENSOR_TEMPLATE_ID.to_string(),
+        name: "Sensor value + label".to_string(),
+        built_in: true,
+        kind: WidgetKind::ValueLabel,
+        style: WidgetStyle {
+            value_font_size: 52.0,
+            label_font_size: 24.0,
+            label_offset_y: 38.0,
+            label_offset_x: 0.0,
+            label_color: [150, 150, 185],
+            color_map: pct_map(),
+            show_missing: false,
+        },
+    }
+}
+
+pub fn widget_local_height(style: &WidgetStyle) -> f32 {
+    let min_y = style.label_offset_y.min(0.0);
+    let max_y = style
+        .value_font_size
+        .max(style.label_offset_y + style.label_font_size);
+    (max_y - min_y).max(1.0)
 }
 
 impl Default for LayoutConfig {
@@ -492,6 +592,12 @@ pub struct Config {
     pub background: BackgroundConfig,
     pub layout: LayoutConfig,
     pub sensors: Vec<SensorConfig>,
+    #[serde(default)]
+    pub widget_model_version: u32,
+    #[serde(default)]
+    pub widget_templates: Vec<WidgetTemplate>,
+    #[serde(default)]
+    pub widget_instances: Vec<WidgetInstance>,
 }
 
 /// Extract a short CPU model string from /proc/cpuinfo, e.g. "Ryzen 7 7800X3D".
@@ -535,7 +641,7 @@ fn default_cpu_label() -> String {
 impl Default for Config {
     fn default() -> Self {
         let cpu_label = default_cpu_label();
-        Self {
+        let mut config = Self {
             rotation: 180.0,
             overlay_enabled: true,
             background: BackgroundConfig::default(),
@@ -609,7 +715,12 @@ impl Default for Config {
                 make_sensor("dimm0_temp", "DIMM 0", "°C", false, temp_map(40.0, 55.0)),
                 make_sensor("dimm1_temp", "DIMM 1", "°C", false, temp_map(40.0, 55.0)),
             ],
-        }
+            widget_model_version: 0,
+            widget_templates: vec![],
+            widget_instances: vec![],
+        };
+        config.migrate_widgets();
+        config
     }
 }
 
@@ -621,9 +732,11 @@ impl Config {
         let text = fs::read_to_string(path)?;
         let source: toml::Value = toml::from_str(&text).map_err(|e| anyhow::anyhow!(e))?;
         let mut config: Self = toml::from_str(&text).map_err(|e| anyhow::anyhow!(e))?;
-        if config.migrate_sensors() || config.migrate_background_transforms(&source) {
-            let _ = config.save(path);
-        }
+        config.migrate_sensors();
+        config.migrate_background_transforms(&source);
+        // Widget migration is intentionally in-memory. The new representation is
+        // persisted only when the user explicitly applies the working config.
+        config.migrate_widgets();
         Ok(config)
     }
 
@@ -679,6 +792,146 @@ impl Config {
 
     pub fn sensor_by_id(&self, id: &str) -> Option<&SensorConfig> {
         self.sensors.iter().find(|s| s.id == id)
+    }
+
+    pub fn widget_template(&self, id: &str) -> Option<&WidgetTemplate> {
+        self.widget_templates
+            .iter()
+            .find(|template| template.id == id)
+    }
+
+    pub fn resolved_widget(&self, instance: &WidgetInstance) -> Option<ResolvedWidget> {
+        let template = self.widget_template(&instance.template_id)?;
+        let source = self.sensor_by_id(&instance.source_id);
+        let overrides = &instance.overrides;
+        let mut style = template.style.clone();
+        if let Some(value) = overrides.value_font_size {
+            style.value_font_size = value;
+        }
+        if let Some(value) = overrides.label_font_size {
+            style.label_font_size = value;
+        }
+        if let Some(value) = overrides.label_offset_y {
+            style.label_offset_y = value;
+        }
+        if let Some(value) = overrides.label_offset_x {
+            style.label_offset_x = value;
+        }
+        if let Some(value) = overrides.label_color {
+            style.label_color = value;
+        }
+        if let Some(value) = &overrides.color_map {
+            style.color_map = value.clone();
+        }
+        if let Some(value) = overrides.show_missing {
+            style.show_missing = value;
+        }
+        Some(ResolvedWidget {
+            id: instance.id.clone(),
+            name: instance.name.clone(),
+            source_id: instance.source_id.clone(),
+            visible: instance.visible,
+            transform: instance.transform,
+            label: overrides.label.clone().unwrap_or_else(|| {
+                source
+                    .map(|source| source.label.clone())
+                    .unwrap_or_else(|| instance.source_id.clone())
+            }),
+            unit: overrides
+                .unit
+                .clone()
+                .unwrap_or_else(|| source.map(|source| source.unit.clone()).unwrap_or_default()),
+            style,
+        })
+    }
+
+    pub fn resolved_widgets(&self) -> Vec<ResolvedWidget> {
+        self.widget_instances
+            .iter()
+            .filter_map(|instance| self.resolved_widget(instance))
+            .collect()
+    }
+
+    pub fn migrate_widgets(&mut self) -> bool {
+        self.widget_templates
+            .retain(|template| template.id != BUILTIN_SENSOR_TEMPLATE_ID);
+        self.widget_templates.insert(0, builtin_sensor_template());
+        if self.widget_model_version >= WIDGET_MODEL_VERSION {
+            return false;
+        }
+        let ids = self.enabled_sensor_ids();
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let slots = self.layout.preset_slots(&refs);
+        for slot in slots {
+            let Some(source) = self.sensor_by_id(&slot.sensor_id).cloned() else {
+                continue;
+            };
+            let label_offset_y = (slot.label_y - slot.value_y) as f32;
+            let label_offset_x = (slot.label_cx - slot.value_cx) as f32;
+            let style = WidgetStyle {
+                value_font_size: slot.value_fs,
+                label_font_size: slot.label_fs,
+                label_offset_y,
+                label_offset_x,
+                label_color: source.label_color,
+                color_map: source.color_map.clone(),
+                show_missing: false,
+            };
+            let height = widget_local_height(&style);
+            let min_y = style.label_offset_y.min(0.0);
+            let source_id = source.id.clone();
+            let source_label = source.label.clone();
+            let source_unit = source.unit.clone();
+            self.widget_instances.push(WidgetInstance {
+                id: format!("legacy-{source_id}"),
+                name: source_label.clone(),
+                template_id: BUILTIN_SENSOR_TEMPLATE_ID.to_string(),
+                source_id,
+                visible: true,
+                transform: Transform2D {
+                    pan_x: slot.value_cx as f32 - 240.0,
+                    pan_y: slot.value_y as f32 + min_y + height / 2.0 - 240.0,
+                    ..Transform2D::default()
+                },
+                overrides: WidgetOverrides {
+                    label: Some(source_label),
+                    unit: Some(source_unit),
+                    value_font_size: Some(slot.value_fs),
+                    label_font_size: Some(slot.label_fs),
+                    label_offset_y: Some(label_offset_y),
+                    label_offset_x: Some(label_offset_x),
+                    label_color: Some(style.label_color),
+                    color_map: Some(style.color_map),
+                    show_missing: None,
+                },
+            });
+        }
+        for source in self.sensors.iter().filter(|source| source.enabled) {
+            if self
+                .widget_instances
+                .iter()
+                .any(|instance| instance.source_id == source.id)
+            {
+                continue;
+            }
+            self.widget_instances.push(WidgetInstance {
+                id: format!("legacy-{}", source.id),
+                name: source.label.clone(),
+                template_id: BUILTIN_SENSOR_TEMPLATE_ID.to_string(),
+                source_id: source.id.clone(),
+                visible: false,
+                transform: Transform2D::default(),
+                overrides: WidgetOverrides {
+                    label: Some(source.label.clone()),
+                    unit: Some(source.unit.clone()),
+                    label_color: Some(source.label_color),
+                    color_map: Some(source.color_map.clone()),
+                    ..WidgetOverrides::default()
+                },
+            });
+        }
+        self.widget_model_version = WIDGET_MODEL_VERSION;
+        true
     }
 }
 
@@ -1003,6 +1256,107 @@ mod tests {
         assert_eq!(slots[0].value_cx, 240);
         assert_eq!(slots[0].value_y, 240);
         assert_eq!(slots[0].label_y, 288);
+    }
+
+    #[test]
+    fn default_config_uses_widget_instances_with_stable_legacy_ids() {
+        let config = Config::default();
+        assert_eq!(config.widget_model_version, WIDGET_MODEL_VERSION);
+        assert!(config.widget_template(BUILTIN_SENSOR_TEMPLATE_ID).is_some());
+        assert!(config
+            .widget_instances
+            .iter()
+            .any(|instance| instance.id == "legacy-cpu_temp"));
+    }
+
+    #[test]
+    fn template_changes_propagate_until_instance_overrides() {
+        let mut config = Config::default();
+        let instance_id = config.widget_instances[0].id.clone();
+        config.widget_instances[0].overrides.value_font_size = None;
+        config.widget_templates[0].style.value_font_size = 77.0;
+        assert_eq!(
+            config
+                .resolved_widget(
+                    config
+                        .widget_instances
+                        .iter()
+                        .find(|instance| instance.id == instance_id)
+                        .unwrap()
+                )
+                .unwrap()
+                .style
+                .value_font_size,
+            77.0
+        );
+        config.widget_instances[0].overrides.value_font_size = Some(33.0);
+        assert_eq!(
+            config
+                .resolved_widget(&config.widget_instances[0])
+                .unwrap()
+                .style
+                .value_font_size,
+            33.0
+        );
+    }
+
+    #[test]
+    fn migrated_hidden_sensors_are_sources_without_visible_instances() {
+        let mut config = Config {
+            widget_model_version: 0,
+            ..Config::default()
+        };
+        config.widget_instances.clear();
+        config.layout.max_visible = 1;
+        config.migrate_widgets();
+        let visible = config
+            .widget_instances
+            .iter()
+            .filter(|instance| instance.visible)
+            .count();
+        assert_eq!(visible, 1);
+        assert_eq!(
+            config.widget_instances.len(),
+            config
+                .sensors
+                .iter()
+                .filter(|sensor| sensor.enabled)
+                .count()
+        );
+    }
+
+    #[test]
+    fn versioned_empty_widget_list_is_not_remigrated() {
+        let mut config = Config::default();
+        config.widget_instances.clear();
+        assert!(!config.migrate_widgets());
+        assert!(config.widget_instances.is_empty());
+    }
+
+    #[test]
+    fn loading_legacy_config_does_not_rewrite_file() {
+        let mut value = toml::Value::try_from(Config::default()).unwrap();
+        let table = value.as_table_mut().unwrap();
+        table.remove("widget_model_version");
+        table.remove("widget_templates");
+        table.remove("widget_instances");
+        let text = toml::to_string_pretty(&value).unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "th420-widget-migration-{}-{}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, &text).unwrap();
+
+        let loaded = Config::load(&path).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        assert_eq!(loaded.widget_model_version, WIDGET_MODEL_VERSION);
+        assert!(!loaded.widget_instances.is_empty());
+        let _ = std::fs::remove_file(path);
     }
 
     // ── migrate_sensors ───────────────────────────────────────────────────────

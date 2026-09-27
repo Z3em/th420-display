@@ -31,58 +31,199 @@ when moving work to `complete`.
 
 ## Confirmed
 
-- [ ] **Replace duplicate Live Display background controls with presets** — the
-  Background editor currently exposes legacy Fit and Zoom controls in addition
-  to the unified transform controls. Remove the old duplicates and provide quick
-  Fit/Contain, Cover, Stretch, and any other useful presentation presets instead.
-  A preset updates the canonical shared fit/transform state; the unified Zoom,
-  Stretch, Pan, and Rotation controls remain available for fine adjustment after
-  applying it.
-
 - [ ] **Maintain `gui_v2` as the active GUI reimplementation** — `th420-config`
   builds from `src/gui_v2.rs`. Retain `src/gui_overhaul.rs` for comparison until
   `gui_v2` has reimplemented every required capability; do not merge the two UIs
   blindly or remove the old implementation prematurely.
 
-- [ ] **Reimplement widgets as templates and instances** — define reusable widget
-  templates, then permit multiple independently configured instances of each
-  template. The Live Display tab provides one Add widget control backed by a
-  template dropdown (or equivalent), plus a list of existing instances for
-  selection, configuration, reordering, and removal. Rework layout, placement,
-  typography, label/value colours, and thresholds within this instance model.
-
 ## Planned
-
-- [ ] **Apply shared transforms to widget instances** — adapt each future widget
-  instance to the common transform and drag/snap contract while keeping its state
-  independent from its template and sibling instances. Transform around measured
-  widget bounds, retain the `Drag`/`Preview` readout and exact numeric controls,
-  and keep widget anchoring, clipping, visibility, and selection handles outside
-  the shared geometry engine. This task depends on the widget template/instance
-  model being implemented.
-
-- [ ] **Close the remaining cross-target transform validation gaps** — existing
-  coverage already exercises shared background/standby/boot geometry, independent
-  target state, animation cadence, and upload gating. Add the missing focused
-  cases for rotation pivot/clipping, canvas fill and cache invalidation, trimmed
-  boot timelines/timing normalization, and optional FFmpeg behavior. Add widget
-  adapter equivalence only after the template/instance model exists. Finish with
-  a visual GUI check; any persistent device upload remains a separate test that
-  requires explicit user approval.
-
-<!-- Move planned tasks here only after their implementation scenario is approved. -->
 
 ## In progress
 
-- [ ] **Add boot-animation editing controls** — add source-range trimming, a
-  timeline scrubber, and explicit uniform delay/FPS controls. The scrubber must
-  preview the transformed frame at the selected source time without changing
-  committed playback timing. Trimming and timing changes must feed the same
-  debounced container inspection used by upload, retain the minimum 80 ms delay,
-  255-frame and 10 MiB limits, and never perform a persistent device write until
-  the user explicitly presses Upload.
-
 ## Complete
+
+- [x] **Use center-origin snapping and center-drawn grids for transformed
+  content** — formalize `(240, 240)` as the 480x480 canvas origin and represent
+  placement as an object-center offset from that point. Snap with symmetric
+  multiples of the active pan grid around zero, using the transformed media
+  center or the measured center of a widget instance as the pivot. Scaling and
+  rotation must preserve that pivot, odd-sized widget bounds must retain
+  half-pixel centers internally, and circular display clipping must remain a
+  visual concern rather than changing the square canvas coordinate system.
+
+  Extract shared center-snap and canvas-to-preview grid helpers for Live
+  backgrounds, Boot media, Standby media, the existing widget-placement adapter
+  where practical, and the future widget instance system. Draw the primary axes
+  through the exact preview center and additional lines outward at
+  `center +/- N * grid size`, with stronger center axes and clipping to the
+  preview. Grid sizes that do not divide 240 evenly must not shift the origin or
+  cause the drawn grid and actual snap points to disagree.
+
+  Extend each target's independent snap settings with its own `Show grid` value,
+  alongside snap enabled, pan-grid size, and rotation interval. Enable snapping
+  and grid visibility by default while allowing the grid to be hidden without
+  disabling snapping. Changing grid size, visibility, or enabled state must not
+  move or resnap committed positions; only a moving drag commits against the
+  active grid, and a click without motion preserves an unsnapped position.
+  Numerical controls and the retained `Drag`/`Preview` readout remain
+  center-relative and use identical terminology across editors.
+
+  Cover exact-center alignment, positive/negative symmetry, non-divisor grid
+  sizes, canvas-to-preview agreement, stable scale/rotation pivots, unchanged
+  committed values after grid changes, per-target independence, click-without-
+  motion behavior, and half-pixel widget centers with regression tests. Validate
+  with the full GUI-enabled suite, Clippy, formatting, diff checks, release
+  builds, visual checks at representative 7/8/12/20 px grids, and a separately
+  reported hardware boundary for device placement.
+
+- [x] **Reimplement widgets as templates and instances** — separate telemetry
+  data sources, reusable presentation templates, and placed widget instances.
+  Data sources own technical identity, availability, current value, and default
+  unit without owning layout or appearance. Templates own a stable ID, name,
+  widget kind, default typography, colours, thresholds, spacing, alignment,
+  sizing, and missing-data presentation without containing a sensor binding,
+  position, or z-order. Ship read-only built-in templates and allow user
+  templates to be duplicated, renamed, edited, and removed only when unused.
+
+  Each placed instance must have its own stable ID, template reference, data-
+  source binding, visibility, center-relative transform, and list position as
+  its z-order. Permit multiple instances of one template and multiple instances
+  bound to one source. Use live template inheritance with sparse per-instance
+  overrides rather than copying template values at creation: unresolved fields
+  follow later template edits, overridden fields remain local, and the GUI
+  exposes clear inherited/overridden state plus `Reset to template` actions.
+
+  Rebuild the Overlay workflow around one `Add widget` template selector and an
+  ordered instance list supporting selection, visibility, rename, duplicate,
+  reorder, and remove. Separate instance editing into Data, Appearance,
+  Transform, and Template/override sections; keep template editing in a distinct
+  mode so an instance edit cannot accidentally modify all siblings. Prevent
+  deletion of referenced templates until their instances are reassigned or
+  removed.
+
+  Resolve each visible instance in list order by combining its template and
+  overrides, reading the bound data source, measuring and rendering local widget
+  bounds, and then handing those bounds to the shared center-origin transform
+  and compositing pipeline. Templates remain position-independent. Define a
+  deterministic missing-data behavior and cache static layout/style work without
+  preventing dynamic value or inherited-template updates.
+
+  Add an idempotent compatibility migration: each currently enabled sensor
+  becomes one instance at its resolved preset/custom-slot position; existing
+  label, unit, colour map, font sizes, and other customized presentation become
+  overrides; disabled sensors remain available as data sources without creating
+  instances. Preserve old `sensors`, layout presets, `max_visible`, and custom
+  slots as readable compatibility input until migration and rendering parity are
+  proven. Cover inheritance, override reset, duplicate bindings and templates,
+  ordering, deletion constraints, stable IDs, missing sources, exact legacy
+  migration, serialization round trips, and renderer output with regression
+  tests before retiring the legacy widget path.
+
+- [x] **Apply shared transforms to widget instances** — adapt each future widget
+  instance to the common transform and drag/snap contract while keeping its state
+  independent from its template and sibling instances. Transform around measured
+  widget bounds using the shared center-origin pivot and center-drawn grid,
+  retain the `Drag`/`Preview` readout and exact numeric controls, and keep widget
+  anchoring, clipping, visibility, and selection handles outside the shared
+  geometry engine. This task depends on both the center-origin foundation and
+  the widget template/instance model being implemented.
+
+- [x] **Refresh Boot and Standby device previews after live edits** — device
+  preview helpers are now keyed by mode, source path, brightness, the complete
+  media transform and canvas colour, Boot trim/timing, and Standby frame time.
+  Changed transforms replace the immutable helper after a 150 ms trailing
+  debounce, while pan and rotation release force an immediate refresh. Mode and
+  source changes remain immediate. Intentional replacement kills and reaps the
+  old child before spawning its successor, keeps the live daemon paused across
+  the handoff, and clears pending work when preview is disabled. Regression tests
+  cover Boot and Standby helper-input invalidation. The full 194-test GUI-enabled
+  suite, Clippy, formatting, diff checks, and release builds pass; perceived
+  device latency and lock handoff await hardware verification.
+
+- [x] **Bring Boot and Standby transform controls to Live Display parity** —
+  removed the legacy Fit dropdown and gave both media tabs the same `1:1`, `Fit`,
+  `Cover`, and `Stretch` visible-value presets as Live Display. All three targets
+  now share native-baseline preset math while retaining their appropriate
+  media-specific controls. Live, Boot, and Standby each own independent snap
+  enabled, pan-grid, and rotation-grid settings, and their preview gestures route
+  exclusively through the active target's settings without resnapping committed
+  transforms. New Boot and Standby sources receive Cover once dimensions arrive;
+  path and transform guards reject stale results and preserve intervening edits.
+  Presets remain disabled until dimensions are known, and Reset establishes a
+  native 1:1 transform without changing canvas colour or snapping preferences.
+  Regression tests cover cross-target preset equivalence, hidden-fit removal,
+  guarded Cover defaults, reset semantics, snap independence, and grid changes.
+  The full 192-test GUI-enabled suite, Clippy, formatting, diff checks, and release
+  builds pass; visual GUI and physical-device behavior await user verification.
+
+- [x] **Rotate transformed media with a natural right-button arc gesture** —
+  right-button dragging now rotates Live Display backgrounds, boot media, and
+  standby media by following the pointer's angular path around the preview
+  center. The reusable rotation state unwraps boundary crossings, maintains
+  independent raw and snapped-preview angles, commits the appropriate normalized
+  angle on release, and ignores unstable starts in a small center dead zone.
+  Primary drag remains pan, the wheel remains zoom, exact numeric controls are
+  retained, and the live `Rotate`/`Preview` readout remains visible. Later snap
+  interval changes do not alter committed rotations. Focused tests cover arc
+  unwrapping, dead-zone handling, snapping, normalization, release semantics,
+  later interval changes, and target-state independence. The full 186-test
+  GUI-enabled suite, Clippy, formatting, diff checks, and release builds pass;
+  visual interaction and physical-device behavior await user verification.
+
+- [x] **Make device preview tab-driven and pause the daemon while it owns the
+  device** — replaced the GUI mode dropdown with one persistent `Show on device`
+  switch. Boot now selects looping boot preview, Standby selects standby preview,
+  and other pages stop the helper while retaining enabled intent. Cross-tab
+  handoff reaps and replaces helpers without resuming between modes; missing
+  sources remain dormant and start when selected, and unexpected exits disable
+  preview with an error. The daemon control socket now supports bounded,
+  acknowledged `pause`, `resume`, and `state` commands. Pause keeps daemon and
+  instance ownership alive while dropping HID and the device lock; resume fully
+  reacquires and initializes them, reports failures while remaining paused, and
+  is idempotent. The GUI resumes only the exact process it changed to paused.
+  `--daemon-control pause|resume|state` provides recovery, startup detects paused
+  state, and Overview exposes a Resume button when no GUI preview owns the pause.
+  Validated by control-state, idempotency, failure, shutdown wake-up, bounded
+  command framing, owner/lifecycle, navigation mapping, CLI parsing, and full
+  GUI-enabled tests. Clippy, formatting, diff checks, and release builds passed;
+  live hardware handoff remains for user verification.
+
+- [x] **Close the current cross-target transform validation gaps** — added
+  focused regression coverage for center-pivot rotation and canvas clipping,
+  native-source canvas fill, transform/cache-layer invalidation, identical
+  trimmed-frame and normalized-timing behavior between boot upload preparation
+  and transient device preview, and the explicit nonfatal error for media that
+  requires a missing optional FFmpeg installation. The full GUI-enabled suite now
+  passes 168 tests. Widget adapter equivalence remains part of the planned shared
+  widget-transform task because the template/instance model does not exist yet.
+  Formatting, Clippy, diff checks, and release builds passed; visual GUI testing
+  and any persistent device upload remain user-controlled validation boundaries.
+
+- [x] **Add boot-animation editing controls** — added inclusive start/end frame
+  trimming, a source-frame timeline scrubber with source-time readout, and linked
+  uniform delay/FPS controls. Scrubbing pauses only the desktop preview and does
+  not alter committed timing. The same trim range, uniform delay, and transform
+  arguments now drive debounced container inspection, transient device preview,
+  and explicit upload. The helper validates nonempty in-range selections and the
+  80 ms minimum; existing container validation retains the 255-frame and 10 MiB
+  limits. Persistent writes still occur only through Upload. Validated by focused
+  trim/timing/argument tests, the full 160-test GUI-enabled suite, Clippy,
+  formatting and diff checks, and rebuilt release binaries; visual GUI and
+  physical-device behavior await user testing.
+
+- [x] **Replace duplicate Live Display background controls with presets** —
+  removed the File/Stream source-level Fit dropdowns and the legacy 0.25–4× Zoom
+  slider. The shared Transform section now provides 1:1, Fit, Cover, and Stretch
+  presets calculated from the selected source dimensions. All presets use native
+  source pixels as their common baseline: 1:1 is the neutral transform, Fit and
+  Cover set visible Zoom, and Stretch sets visible independent X/Y Stretch.
+  Newly selected File or Stream
+  sources apply Cover by default. Pan and rotation reset to a predictable
+  baseline, and all unified transform, snapping, and exact controls remain
+  available for fine adjustment. Validated for landscape, portrait, and
+  below-canvas native sources by preset-state regression coverage, GUI-enabled
+  tests, source inspection confirming one canonical background Zoom control,
+  formatting and diff checks.
 
 - [x] **Stabilize preview helper and daemon lifecycles** — switching between
   Boot and Standby device previews now stops and reaps the old helper without

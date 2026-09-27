@@ -6,7 +6,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -71,11 +71,140 @@ pub struct InstanceGuard {
     socket_path: PathBuf,
     listener_stop: Arc<AtomicBool>,
     listener: Option<JoinHandle<()>>,
+    daemon_control: Option<Arc<DaemonControl>>,
 }
 
 #[allow(dead_code)] // Device ownership is used by the daemon binary, not the GUI binary.
 pub struct DeviceGuard {
     lock_file: File,
+}
+
+#[derive(Debug)]
+struct DaemonControlStatus {
+    desired_paused: bool,
+    actual_paused: bool,
+    transition_error: Option<String>,
+    stopping: bool,
+    starting: bool,
+}
+
+#[derive(Debug)]
+pub struct DaemonControl {
+    status: Mutex<DaemonControlStatus>,
+    changed: Condvar,
+}
+
+impl DaemonControl {
+    pub fn new_starting() -> Arc<Self> {
+        Arc::new(Self {
+            status: Mutex::new(DaemonControlStatus {
+                desired_paused: false,
+                actual_paused: false,
+                transition_error: None,
+                stopping: false,
+                starting: true,
+            }),
+            changed: Condvar::new(),
+        })
+    }
+
+    pub fn pause_requested(&self) -> bool {
+        self.status.lock().unwrap().desired_paused
+    }
+
+    pub fn mark_paused(&self) {
+        let mut status = self.status.lock().unwrap();
+        status.actual_paused = true;
+        status.starting = false;
+        status.transition_error = None;
+        self.changed.notify_all();
+    }
+
+    pub fn mark_running(&self) {
+        let mut status = self.status.lock().unwrap();
+        status.actual_paused = false;
+        status.starting = false;
+        status.transition_error = None;
+        self.changed.notify_all();
+    }
+
+    pub fn mark_resume_failed(&self, error: String) {
+        let mut status = self.status.lock().unwrap();
+        status.desired_paused = true;
+        status.actual_paused = true;
+        status.starting = false;
+        status.transition_error = Some(error);
+        self.changed.notify_all();
+    }
+
+    fn stop(&self) {
+        let mut status = self.status.lock().unwrap();
+        status.stopping = true;
+        self.changed.notify_all();
+    }
+
+    fn command(&self, command: &str, timeout: Duration) -> Result<String, String> {
+        let mut status = self.status.lock().unwrap();
+        if status.stopping {
+            return Err("daemon is stopping".into());
+        }
+        let changed = match command {
+            "pause" => {
+                let changed = !status.desired_paused && !status.actual_paused;
+                status.desired_paused = true;
+                changed
+            }
+            "resume" => {
+                let changed = status.desired_paused && status.actual_paused;
+                status.desired_paused = false;
+                status.transition_error = None;
+                changed
+            }
+            "state" => return Ok(control_state(&status).into()),
+            _ => return Err(format!("unsupported daemon command: {command}")),
+        };
+        let desired = status.desired_paused;
+        let (status, wait) = self
+            .changed
+            .wait_timeout_while(status, timeout, |status| {
+                status.actual_paused != desired
+                    && status.transition_error.is_none()
+                    && !status.stopping
+            })
+            .unwrap();
+        if let Some(error) = &status.transition_error {
+            return Err(error.clone());
+        }
+        if status.stopping {
+            return Err("daemon is stopping".into());
+        }
+        if wait.timed_out() && status.actual_paused != desired {
+            return Err(format!(
+                "daemon did not enter {} state",
+                if desired { "paused" } else { "running" }
+            ));
+        }
+        Ok(format!(
+            "{} {}",
+            control_state(&status),
+            if changed { "changed" } else { "unchanged" }
+        ))
+    }
+}
+
+fn control_state(status: &DaemonControlStatus) -> &'static str {
+    if status.stopping {
+        return "stopping";
+    }
+    if status.starting && !status.desired_paused {
+        return "starting";
+    }
+    match (status.desired_paused, status.actual_paused) {
+        (false, false) => "running",
+        (true, true) => "paused",
+        (true, false) => "pausing",
+        (false, true) => "resuming",
+    }
 }
 
 impl DeviceGuard {
@@ -118,13 +247,23 @@ impl InstanceGuard {
         shutdown_requested: Arc<AtomicBool>,
     ) -> Result<Self, AcquireError> {
         let (lock_path, socket_path) = instance_paths(kind).map_err(AcquireError::Other)?;
-        Self::try_acquire_paths(lock_path, socket_path, shutdown_requested)
+        Self::try_acquire_paths(lock_path, socket_path, shutdown_requested, None)
+    }
+
+    pub fn try_acquire_daemon(
+        shutdown_requested: Arc<AtomicBool>,
+        control: Arc<DaemonControl>,
+    ) -> Result<Self, AcquireError> {
+        let (lock_path, socket_path) =
+            instance_paths(InstanceKind::Daemon).map_err(AcquireError::Other)?;
+        Self::try_acquire_paths(lock_path, socket_path, shutdown_requested, Some(control))
     }
 
     fn try_acquire_paths(
         lock_path: PathBuf,
         socket_path: PathBuf,
         shutdown_requested: Arc<AtomicBool>,
+        daemon_control: Option<Arc<DaemonControl>>,
     ) -> Result<Self, AcquireError> {
         let mut lock = OpenOptions::new()
             .read(true)
@@ -175,15 +314,24 @@ impl InstanceGuard {
             }
             let listener_stop = Arc::new(AtomicBool::new(false));
             let thread_stop = listener_stop.clone();
+            let thread_control = daemon_control.clone();
             let listener_thread = thread::spawn(move || {
                 while !thread_stop.load(Ordering::Relaxed) {
                     match listener.accept() {
                         Ok((mut stream, _)) => {
-                            let mut command = [0_u8; 32];
-                            if let Ok(count) = stream.read(&mut command) {
-                                if command[..count].starts_with(b"shutdown") {
+                            if let Ok(command) = read_control_command(&mut stream) {
+                                if command == "shutdown" {
                                     shutdown_requested.store(true, Ordering::SeqCst);
                                     let _ = stream.write_all(b"ok\n");
+                                } else if let Some(control) = &thread_control {
+                                    let response =
+                                        match control.command(&command, Duration::from_secs(5)) {
+                                            Ok(state) => format!("ok {state}\n"),
+                                            Err(error) => format!("error {error}\n"),
+                                        };
+                                    let _ = stream.write_all(response.as_bytes());
+                                } else {
+                                    let _ = stream.write_all(b"error unsupported command\n");
                                 }
                             }
                         }
@@ -199,6 +347,7 @@ impl InstanceGuard {
                 socket_path,
                 listener_stop,
                 listener: Some(listener_thread),
+                daemon_control,
             })
         }
     }
@@ -206,6 +355,9 @@ impl InstanceGuard {
 
 impl Drop for InstanceGuard {
     fn drop(&mut self) {
+        if let Some(control) = &self.daemon_control {
+            control.stop();
+        }
         self.listener_stop.store(true, Ordering::Relaxed);
         if let Some(listener) = self.listener.take() {
             let _ = listener.join();
@@ -231,6 +383,44 @@ pub fn request_graceful(owner: &OwnerInfo, timeout: Duration) -> Result<(), Stri
         .write_all(b"shutdown\n")
         .map_err(|error| format!("cannot request graceful shutdown: {error}"))?;
     wait_for_release(&verified, timeout)
+}
+
+pub fn request_daemon_command(
+    owner: &OwnerInfo,
+    command: &str,
+    timeout: Duration,
+) -> Result<String, String> {
+    if !matches!(command, "pause" | "resume" | "state") {
+        return Err(format!("unsupported daemon command: {command}"));
+    }
+    let verified = revalidate_owner(owner)?;
+    let mut stream = UnixStream::connect(&verified.socket_path).map_err(|error| {
+        format!(
+            "cannot connect to {}: {error}",
+            verified.socket_path.display()
+        )
+    })?;
+    stream
+        .set_read_timeout(Some(timeout + Duration::from_secs(1)))
+        .map_err(|error| error.to_string())?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(1)))
+        .map_err(|error| error.to_string())?;
+    stream
+        .write_all(format!("{command}\n").as_bytes())
+        .map_err(|error| format!("cannot request daemon {command}: {error}"))?;
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .map_err(|error| format!("cannot read daemon response: {error}"))?;
+    let response = response.trim();
+    if let Some(state) = response.strip_prefix("ok ") {
+        Ok(state.to_string())
+    } else if let Some(error) = response.strip_prefix("error ") {
+        Err(error.to_string())
+    } else {
+        Err(format!("invalid daemon response: {response}"))
+    }
 }
 
 pub fn signal_owner(owner: &OwnerInfo, signal: i32, timeout: Duration) -> Result<(), String> {
@@ -268,7 +458,29 @@ pub fn replace_and_acquire(
     shutdown_requested: Arc<AtomicBool>,
     level: ReplaceExisting,
 ) -> Result<InstanceGuard, String> {
-    let owner = match InstanceGuard::try_acquire(kind, shutdown_requested.clone()) {
+    replace_and_acquire_controlled(kind, shutdown_requested, level, None)
+}
+
+pub fn replace_and_acquire_daemon(
+    shutdown_requested: Arc<AtomicBool>,
+    level: ReplaceExisting,
+    control: Arc<DaemonControl>,
+) -> Result<InstanceGuard, String> {
+    replace_and_acquire_controlled(
+        InstanceKind::Daemon,
+        shutdown_requested,
+        level,
+        Some(control),
+    )
+}
+
+fn replace_and_acquire_controlled(
+    kind: InstanceKind,
+    shutdown_requested: Arc<AtomicBool>,
+    level: ReplaceExisting,
+    control: Option<Arc<DaemonControl>>,
+) -> Result<InstanceGuard, String> {
+    let owner = match try_acquire_controlled(kind, shutdown_requested.clone(), control.clone()) {
         Ok(guard) => return Ok(guard),
         Err(AcquireError::Conflict(owner)) => owner,
         Err(AcquireError::Other(error)) => return Err(error),
@@ -276,14 +488,14 @@ pub fn replace_and_acquire(
     let mut attempts = Vec::new();
     attempts.push("graceful shutdown".to_string());
     if request_graceful(&owner, Duration::from_secs(3)).is_ok() {
-        return acquire_after_exit(kind, shutdown_requested);
+        return acquire_after_exit(kind, shutdown_requested, control);
     }
     if matches!(level, ReplaceExisting::Graceful) {
         return Err(replacement_failure(&owner, &attempts));
     }
     attempts.push("SIGTERM".to_string());
     if signal_owner(&owner, libc::SIGTERM, Duration::from_secs(3)).is_ok() {
-        return acquire_after_exit(kind, shutdown_requested);
+        return acquire_after_exit(kind, shutdown_requested, control);
     }
     if matches!(level, ReplaceExisting::Term) {
         return Err(replacement_failure(&owner, &attempts));
@@ -291,20 +503,32 @@ pub fn replace_and_acquire(
     attempts.push("SIGKILL".to_string());
     signal_owner(&owner, libc::SIGKILL, Duration::from_secs(3))
         .map_err(|_| replacement_failure(&owner, &attempts))?;
-    acquire_after_exit(kind, shutdown_requested)
+    acquire_after_exit(kind, shutdown_requested, control)
 }
 
 fn acquire_after_exit(
     kind: InstanceKind,
     shutdown_requested: Arc<AtomicBool>,
+    control: Option<Arc<DaemonControl>>,
 ) -> Result<InstanceGuard, String> {
-    InstanceGuard::try_acquire(kind, shutdown_requested).map_err(|error| match error {
+    try_acquire_controlled(kind, shutdown_requested, control).map_err(|error| match error {
         AcquireError::Conflict(owner) => format!(
             "another instance acquired ownership during replacement:\n{}",
             owner.describe()
         ),
         AcquireError::Other(error) => error,
     })
+}
+
+fn try_acquire_controlled(
+    kind: InstanceKind,
+    shutdown_requested: Arc<AtomicBool>,
+    control: Option<Arc<DaemonControl>>,
+) -> Result<InstanceGuard, AcquireError> {
+    match control {
+        Some(control) => InstanceGuard::try_acquire_daemon(shutdown_requested, control),
+        None => InstanceGuard::try_acquire(kind, shutdown_requested),
+    }
 }
 
 fn replacement_failure(owner: &OwnerInfo, attempts: &[String]) -> String {
@@ -350,6 +574,27 @@ fn wait_for_release(owner: &OwnerInfo, timeout: Duration) -> Result<(), String> 
         "PID {} did not release ownership within {:?}",
         owner.pid, timeout
     ))
+}
+
+fn read_control_command(mut reader: impl Read) -> Result<String, String> {
+    let mut bytes = Vec::with_capacity(16);
+    loop {
+        let mut byte = [0_u8; 1];
+        match reader.read(&mut byte) {
+            Ok(0) => return Err("control command ended before newline".into()),
+            Ok(_) if byte[0] == b'\n' => break,
+            Ok(_) => {
+                if bytes.len() == 32 {
+                    return Err("control command is too long".into());
+                }
+                bytes.push(byte[0]);
+            }
+            Err(error) => return Err(format!("cannot read control command: {error}")),
+        }
+    }
+    String::from_utf8(bytes)
+        .map(|command| command.trim_end_matches('\r').to_string())
+        .map_err(|_| "control command is not UTF-8".into())
 }
 
 fn lock_is_available(path: &Path) -> bool {
@@ -570,6 +815,92 @@ mod tests {
     }
 
     #[test]
+    fn daemon_pause_resume_is_acknowledged_and_idempotent() {
+        let control = DaemonControl::new_starting();
+        control.mark_running();
+        let requester = {
+            let control = control.clone();
+            thread::spawn(move || control.command("pause", Duration::from_secs(1)))
+        };
+        while !control.pause_requested() {
+            thread::yield_now();
+        }
+        control.mark_paused();
+        assert_eq!(requester.join().unwrap().unwrap(), "paused changed");
+        assert_eq!(
+            control.command("pause", Duration::from_millis(10)).unwrap(),
+            "paused unchanged"
+        );
+
+        let requester = {
+            let control = control.clone();
+            thread::spawn(move || control.command("resume", Duration::from_secs(1)))
+        };
+        while control.pause_requested() {
+            thread::yield_now();
+        }
+        control.mark_running();
+        assert_eq!(requester.join().unwrap().unwrap(), "running changed");
+        assert_eq!(
+            control
+                .command("resume", Duration::from_millis(10))
+                .unwrap(),
+            "running unchanged"
+        );
+    }
+
+    #[test]
+    fn daemon_failed_resume_stays_paused_and_reports_error() {
+        let control = DaemonControl::new_starting();
+        control.mark_running();
+        let pause = {
+            let control = control.clone();
+            thread::spawn(move || control.command("pause", Duration::from_secs(1)))
+        };
+        while !control.pause_requested() {
+            thread::yield_now();
+        }
+        control.mark_paused();
+        pause.join().unwrap().unwrap();
+
+        let resume = {
+            let control = control.clone();
+            thread::spawn(move || control.command("resume", Duration::from_secs(1)))
+        };
+        while control.pause_requested() {
+            thread::yield_now();
+        }
+        control.mark_resume_failed("device remains busy".into());
+        assert_eq!(resume.join().unwrap().unwrap_err(), "device remains busy");
+        assert_eq!(control.command("state", Duration::ZERO).unwrap(), "paused");
+    }
+
+    #[test]
+    fn control_command_requires_complete_bounded_line() {
+        assert_eq!(
+            read_control_command(std::io::Cursor::new(b"pause\n")).unwrap(),
+            "pause"
+        );
+        assert!(read_control_command(std::io::Cursor::new(b"pau")).is_err());
+        assert!(read_control_command(std::io::Cursor::new([b'x'; 34])).is_err());
+    }
+
+    #[test]
+    fn daemon_stop_wakes_a_pending_transition() {
+        let control = DaemonControl::new_starting();
+        control.mark_paused();
+        let requester = {
+            let control = control.clone();
+            thread::spawn(move || control.command("resume", Duration::from_secs(5)))
+        };
+        while control.pause_requested() {
+            thread::yield_now();
+        }
+        control.stop();
+        assert_eq!(requester.join().unwrap().unwrap_err(), "daemon is stopping");
+    }
+
+    #[test]
     fn duplicate_is_rejected_and_graceful_shutdown_hands_off_lock() {
         let suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -587,12 +918,14 @@ mod tests {
             lock_path.clone(),
             socket_path.clone(),
             shutdown.clone(),
+            None,
         )
         .unwrap();
         let owner = match InstanceGuard::try_acquire_paths(
             lock_path.clone(),
             socket_path.clone(),
             Arc::new(AtomicBool::new(false)),
+            None,
         ) {
             Err(AcquireError::Conflict(owner)) => owner,
             _ => panic!("second acquisition must report the verified owner"),
@@ -609,6 +942,7 @@ mod tests {
             lock_path.clone(),
             socket_path.clone(),
             Arc::new(AtomicBool::new(false)),
+            None,
         )
         .unwrap();
         drop(replacement);
