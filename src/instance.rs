@@ -86,6 +86,15 @@ struct DaemonControlStatus {
     transition_error: Option<String>,
     stopping: bool,
     starting: bool,
+    telemetry: Option<DaemonTelemetry>,
+    telemetry_error: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct DaemonTelemetry {
+    coolant_temp_c: f32,
+    pump_rpm: u16,
+    updated_at: Instant,
 }
 
 #[derive(Debug)]
@@ -103,6 +112,8 @@ impl DaemonControl {
                 transition_error: None,
                 stopping: false,
                 starting: true,
+                telemetry: None,
+                telemetry_error: None,
             }),
             changed: Condvar::new(),
         })
@@ -137,6 +148,20 @@ impl DaemonControl {
         self.changed.notify_all();
     }
 
+    pub fn update_telemetry(&self, coolant_temp_c: f32, pump_rpm: u16) {
+        let mut status = self.status.lock().unwrap();
+        status.telemetry = Some(DaemonTelemetry {
+            coolant_temp_c,
+            pump_rpm,
+            updated_at: Instant::now(),
+        });
+        status.telemetry_error = None;
+    }
+
+    pub fn mark_telemetry_error(&self, error: String) {
+        self.status.lock().unwrap().telemetry_error = Some(error);
+    }
+
     fn stop(&self) {
         let mut status = self.status.lock().unwrap();
         status.stopping = true;
@@ -161,6 +186,20 @@ impl DaemonControl {
                 changed
             }
             "state" => return Ok(control_state(&status).into()),
+            "telemetry" => {
+                let Some(telemetry) = &status.telemetry else {
+                    return Err(status
+                        .telemetry_error
+                        .clone()
+                        .unwrap_or_else(|| "device telemetry is not available yet".into()));
+                };
+                return Ok(format!(
+                    "coolant_temp_c={:.1}\npump_rpm={}\nage_ms={}",
+                    telemetry.coolant_temp_c,
+                    telemetry.pump_rpm,
+                    telemetry.updated_at.elapsed().as_millis()
+                ));
+            }
             _ => return Err(format!("unsupported daemon command: {command}")),
         };
         let desired = status.desired_paused;
@@ -390,7 +429,7 @@ pub fn request_daemon_command(
     command: &str,
     timeout: Duration,
 ) -> Result<String, String> {
-    if !matches!(command, "pause" | "resume" | "state") {
+    if !matches!(command, "pause" | "resume" | "state" | "telemetry") {
         return Err(format!("unsupported daemon command: {command}"));
     }
     let verified = revalidate_owner(owner)?;
@@ -873,6 +912,24 @@ mod tests {
         control.mark_resume_failed("device remains busy".into());
         assert_eq!(resume.join().unwrap().unwrap_err(), "device remains busy");
         assert_eq!(control.command("state", Duration::ZERO).unwrap(), "paused");
+    }
+
+    #[test]
+    fn daemon_telemetry_preserves_last_valid_sample_after_error() {
+        let control = DaemonControl::new_starting();
+        assert!(control
+            .command("telemetry", Duration::ZERO)
+            .unwrap_err()
+            .contains("not available"));
+
+        control.update_telemetry(28.5, 2320);
+        let sample = control.command("telemetry", Duration::ZERO).unwrap();
+        assert!(sample.contains("coolant_temp_c=28.5"));
+        assert!(sample.contains("pump_rpm=2320"));
+
+        control.mark_telemetry_error("temporary read failure".into());
+        let retained = control.command("telemetry", Duration::ZERO).unwrap();
+        assert!(retained.contains("coolant_temp_c=28.5"));
     }
 
     #[test]

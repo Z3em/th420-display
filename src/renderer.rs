@@ -10,7 +10,9 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::time::{Duration, Instant};
 
-use crate::config::{BackgroundConfig, Config, ImageFit, MediaTransform, Transform2D};
+use crate::config::{
+    effective_label_offset_y, BackgroundConfig, Config, ImageFit, MediaTransform, Transform2D,
+};
 use crate::sensors::SensorValues;
 
 const FONT_BYTES: &[u8] = include_bytes!("../assets/NotoSans-Bold.ttf");
@@ -712,7 +714,8 @@ fn draw_widget_instance(
         .map(|value| crate::config::interpolate_color(value, &widget.style.color_map))
         .unwrap_or([150, 150, 150]);
     let [logical_width, logical_height] = widget_layer_dimensions(font, widget, &value);
-    let min_y = widget.style.label_offset_y.min(0.0);
+    let label_offset_y = effective_label_offset_y(&widget.style);
+    let min_y = label_offset_y.min(0.0);
     let width = logical_width.ceil().max(1.0) as u32;
     let height = logical_height.ceil().max(1.0) as u32;
     let mut layer = RgbaImage::new(width, height);
@@ -730,7 +733,7 @@ fn draw_widget_instance(
         font,
         &widget.label,
         (width as f32 / 2.0 + widget.style.label_offset_x).round() as i32,
-        (4.0 + widget.style.label_offset_y - min_y).round() as i32,
+        (4.0 + label_offset_y - min_y).round() as i32,
         widget.style.label_font_size,
         Rgba([
             widget.style.label_color[0],
@@ -771,11 +774,12 @@ fn widget_layer_dimensions(
         &widget.label,
     );
     let half_width = (value_width / 2.0).max(widget.style.label_offset_x.abs() + label_width / 2.0);
-    let min_y = widget.style.label_offset_y.min(0.0);
+    let label_offset_y = effective_label_offset_y(&widget.style);
+    let min_y = label_offset_y.min(0.0);
     let max_y = widget
         .style
         .value_font_size
-        .max(widget.style.label_offset_y + widget.style.label_font_size);
+        .max(label_offset_y + widget.style.label_font_size);
     [
         (half_width * 2.0).ceil().max(1.0) + 8.0,
         (max_y - min_y).ceil().max(1.0) + 8.0,

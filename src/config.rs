@@ -353,11 +353,24 @@ pub fn builtin_sensor_template() -> WidgetTemplate {
 }
 
 pub fn widget_local_height(style: &WidgetStyle) -> f32 {
-    let min_y = style.label_offset_y.min(0.0);
+    let label_offset_y = effective_label_offset_y(style);
+    let min_y = label_offset_y.min(0.0);
     let max_y = style
         .value_font_size
-        .max(style.label_offset_y + style.label_font_size);
+        .max(label_offset_y + style.label_font_size);
     (max_y - min_y).max(1.0)
+}
+
+/// Resolve a label's requested top offset without allowing its line box to
+/// collide with the value's line box. The sign retains the template's choice
+/// of placing the label above or below the value.
+pub fn effective_label_offset_y(style: &WidgetStyle) -> f32 {
+    const TEXT_GAP: f32 = 4.0;
+    if style.label_offset_y < 0.0 {
+        style.label_offset_y.min(-style.label_font_size - TEXT_GAP)
+    } else {
+        style.label_offset_y.max(style.value_font_size + TEXT_GAP)
+    }
 }
 
 impl Default for LayoutConfig {
@@ -878,7 +891,7 @@ impl Config {
                 show_missing: false,
             };
             let height = widget_local_height(&style);
-            let min_y = style.label_offset_y.min(0.0);
+            let min_y = effective_label_offset_y(&style).min(0.0);
             let source_id = source.id.clone();
             let source_label = source.label.clone();
             let source_unit = source.unit.clone();
@@ -1298,6 +1311,20 @@ mod tests {
                 .value_font_size,
             33.0
         );
+    }
+
+    #[test]
+    fn widget_label_layout_preserves_side_and_prevents_line_box_overlap() {
+        let mut style = builtin_sensor_template().style;
+        assert_eq!(effective_label_offset_y(&style), 56.0);
+        assert_eq!(widget_local_height(&style), 80.0);
+
+        style.label_offset_y = -10.0;
+        assert_eq!(effective_label_offset_y(&style), -28.0);
+        assert_eq!(widget_local_height(&style), 80.0);
+
+        style.label_offset_y = 72.0;
+        assert_eq!(effective_label_offset_y(&style), 72.0);
     }
 
     #[test]

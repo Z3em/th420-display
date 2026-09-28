@@ -208,6 +208,13 @@ enum StandbyWorkerResult {
     Frame(StandbyFrameKey, Result<image::RgbImage, String>),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct DeviceTelemetry {
+    coolant_temp_c: f32,
+    pump_rpm: u16,
+    age_ms: u128,
+}
+
 struct App {
     shutdown_requested: Arc<AtomicBool>,
     page: Page,
@@ -239,6 +246,11 @@ struct App {
     device_info: DeviceInfo,
     device_coolant: Option<f32>,
     device_pump_rpm: Option<u16>,
+    device_status_error: Option<String>,
+    device_status_pending: bool,
+    device_status_tx: Sender<Result<DeviceTelemetry, String>>,
+    device_status_rx: Receiver<Result<DeviceTelemetry, String>>,
+    last_device_status_request: Instant,
     last_device_scan: Instant,
 
     preview_texture: Option<egui::TextureHandle>,
@@ -487,6 +499,7 @@ impl App {
         let (boot_inspection_tx, boot_inspection_rx) = mpsc::channel();
         let (boot_animation_tx, boot_animation_rx) = mpsc::channel();
         let (standby_worker_tx, standby_worker_rx) = mpsc::channel();
+        let (device_status_tx, device_status_rx) = mpsc::channel();
         let mut app = Self {
             shutdown_requested,
             page: Page::Overview,
@@ -517,6 +530,11 @@ impl App {
             device_info: detect_device_info(),
             device_coolant: None,
             device_pump_rpm: None,
+            device_status_error: None,
+            device_status_pending: false,
+            device_status_tx,
+            device_status_rx,
+            last_device_status_request: Instant::now() - Duration::from_secs(10),
             last_device_scan: Instant::now(),
             preview_texture: None,
             last_preview_update: Instant::now() - Duration::from_secs(10),
@@ -576,6 +594,7 @@ impl App {
             last_error: None,
         };
         app.refresh_sensors();
+        app.start_device_status_refresh();
         app
     }
 
@@ -588,6 +607,30 @@ impl App {
     }
 
     fn poll(&mut self) {
+        while let Ok(result) = self.device_status_rx.try_recv() {
+            self.device_status_pending = false;
+            match result {
+                Ok(telemetry) => {
+                    self.device_coolant = Some(telemetry.coolant_temp_c);
+                    self.device_pump_rpm = Some(telemetry.pump_rpm);
+                    self.device_status_error = if telemetry.age_ms > 3_000 {
+                        Some(format!(
+                            "Device telemetry is stale ({} ms old)",
+                            telemetry.age_ms
+                        ))
+                    } else {
+                        None
+                    };
+                    self.refresh_sensors();
+                }
+                Err(error) => self.device_status_error = Some(error),
+            }
+        }
+        if !self.device_status_pending
+            && self.last_device_status_request.elapsed() >= Duration::from_secs(1)
+        {
+            self.start_device_status_refresh();
+        }
         if self.last_sensor_update.elapsed() >= Duration::from_secs(1) {
             self.refresh_sensors();
             self.last_sensor_update = Instant::now();
@@ -1740,12 +1783,14 @@ impl App {
                 ui.label(egui::RichText::new("Device metrics").strong());
                 if ui
                     .add_enabled(
-                        self.device_info.connected && self.device_preview_job.is_none(),
+                        self.device_info.connected
+                            && self.device_preview_job.is_none()
+                            && !self.device_status_pending,
                         egui::Button::new("Refresh"),
                     )
                     .clicked()
                 {
-                    self.read_device_status();
+                    self.start_device_status_refresh();
                 }
             });
             egui::Grid::new("overview-metrics")
@@ -1769,6 +1814,13 @@ impl App {
                     ui.label(format!("{}%", self.brightness));
                     ui.end_row();
                 });
+            if let Some(error) = &self.device_status_error {
+                ui.label(
+                    egui::RichText::new(error)
+                        .small()
+                        .color(egui::Color32::YELLOW),
+                );
+            }
         });
         ui.add_space(12.0);
         ui.horizontal(|ui| {
@@ -2863,33 +2915,16 @@ impl App {
         });
     }
 
-    fn read_device_status(&mut self) {
-        let restore = self.daemon_running;
-        if restore && !self.stop_live_daemon() {
+    fn start_device_status_refresh(&mut self) {
+        if self.device_status_pending {
             return;
         }
-        let result = Command::new(daemon_binary_path()).arg("--status").output();
-        if restore {
-            self.start_live_daemon();
-        }
-        match result {
-            Ok(output) if output.status.success() => {
-                let text = String::from_utf8_lossy(&output.stdout);
-                for line in text.lines() {
-                    if let Some(value) = line.strip_prefix("coolant_temp_c=") {
-                        self.device_coolant = value.trim().parse().ok();
-                    }
-                    if let Some(value) = line.strip_prefix("pump_rpm=") {
-                        self.device_pump_rpm = value.trim().parse().ok();
-                    }
-                }
-                self.refresh_sensors();
-            }
-            Ok(output) => {
-                self.last_error = Some(String::from_utf8_lossy(&output.stderr).trim().to_string());
-            }
-            Err(err) => self.last_error = Some(format!("Failed to read device status: {err}")),
-        }
+        self.device_status_pending = true;
+        self.last_device_status_request = Instant::now();
+        let tx = self.device_status_tx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(query_device_telemetry());
+        });
     }
 
     fn run_short_device_command(&mut self, label: &str, args: Vec<String>) {
@@ -3305,6 +3340,52 @@ fn snap(value: f32, grid: f32) -> f32 {
     }
 }
 
+fn query_device_telemetry() -> Result<DeviceTelemetry, String> {
+    if let Some(owner) = current_owner(InstanceKind::Daemon) {
+        let response = request_daemon_command(&owner, "telemetry", Duration::from_secs(1))?;
+        return parse_device_telemetry(&response);
+    }
+
+    let output = Command::new(daemon_binary_path())
+        .arg("--status")
+        .output()
+        .map_err(|error| format!("Failed to read device status: {error}"))?;
+    if !output.status.success() {
+        let error = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if error.is_empty() {
+            format!("Device status command exited with {}", output.status)
+        } else {
+            error
+        });
+    }
+    parse_device_telemetry(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn parse_device_telemetry(text: &str) -> Result<DeviceTelemetry, String> {
+    let mut coolant_temp_c = None;
+    let mut pump_rpm = None;
+    let mut age_ms = 0;
+    for line in text.lines() {
+        if let Some(value) = line.strip_prefix("coolant_temp_c=") {
+            coolant_temp_c = value.trim().parse::<f32>().ok();
+        } else if let Some(value) = line.strip_prefix("pump_rpm=") {
+            pump_rpm = value.trim().parse::<u16>().ok();
+        } else if let Some(value) = line.strip_prefix("age_ms=") {
+            age_ms = value.trim().parse::<u128>().unwrap_or(0);
+        }
+    }
+    let coolant_temp_c = coolant_temp_c
+        .filter(|value| value.is_finite())
+        .ok_or_else(|| "Device status did not contain a valid coolant temperature".to_string())?;
+    let pump_rpm =
+        pump_rpm.ok_or_else(|| "Device status did not contain a valid pump RPM".to_string())?;
+    Ok(DeviceTelemetry {
+        coolant_temp_c,
+        pump_rpm,
+        age_ms,
+    })
+}
+
 fn paint_centered_grid(ui: &egui::Ui, rect: egui::Rect, grid: f32) {
     for coordinate in centered_grid_coordinates(grid) {
         let offset = coordinate / 480.0 * rect.width();
@@ -3448,6 +3529,17 @@ fn color_map_editor(ui: &mut egui::Ui, map: &mut Vec<config::ColorPoint>) {
 #[cfg(test)]
 mod transform_drag_tests {
     use super::*;
+
+    #[test]
+    fn parses_daemon_and_direct_device_telemetry() {
+        let telemetry =
+            parse_device_telemetry("coolant_temp_c=28.5\npump_rpm=2320\nage_ms=17\n").unwrap();
+        assert_eq!(telemetry.coolant_temp_c, 28.5);
+        assert_eq!(telemetry.pump_rpm, 2320);
+        assert_eq!(telemetry.age_ms, 17);
+
+        assert!(parse_device_telemetry("pump_rpm=2320\n").is_err());
+    }
 
     #[test]
     fn per_frame_pointer_deltas_accumulate_across_drag() {

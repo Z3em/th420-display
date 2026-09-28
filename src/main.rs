@@ -663,10 +663,15 @@ fn main() -> Result<()> {
     let mut sensors = sensors::SensorReader::new();
     let mut renderer = renderer::Renderer::new();
     let mut values = sensors.read();
-    values.readings.insert(
-        "coolant".to_string(),
-        dev.as_mut().unwrap().read_liquid_temp().unwrap_or(0.0),
-    );
+    match dev.as_mut().unwrap().read_status() {
+        Ok(status) => {
+            values
+                .readings
+                .insert("coolant".to_string(), status.coolant_temp_c);
+            daemon_control.update_telemetry(status.coolant_temp_c, status.pump_rpm);
+        }
+        Err(error) => daemon_control.mark_telemetry_error(error.to_string()),
+    }
     let mut last_sensor_update = Instant::now();
     let mut daemon_is_paused = false;
 
@@ -720,11 +725,22 @@ fn main() -> Result<()> {
         }
 
         if last_sensor_update.elapsed() >= interval {
+            let previous_coolant = values.readings.get("coolant").copied();
             values = sensors.read();
-            values.readings.insert(
-                "coolant".to_string(),
-                dev.as_mut().unwrap().read_liquid_temp().unwrap_or(0.0),
-            );
+            match dev.as_mut().unwrap().read_status() {
+                Ok(status) => {
+                    values
+                        .readings
+                        .insert("coolant".to_string(), status.coolant_temp_c);
+                    daemon_control.update_telemetry(status.coolant_temp_c, status.pump_rpm);
+                }
+                Err(error) => {
+                    if let Some(coolant) = previous_coolant {
+                        values.readings.insert("coolant".to_string(), coolant);
+                    }
+                    daemon_control.mark_telemetry_error(error.to_string());
+                }
+            }
             last_sensor_update = Instant::now();
         }
 
