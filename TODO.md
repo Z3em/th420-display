@@ -29,16 +29,197 @@ when moving work to `complete`.
   setting has an intentional GUI control or an explicitly documented reason to be
   configuration-only.
 
+- [ ] **Decide transient Live playback parity** — `gui_overhaul` exposed finite
+  GIF playback and frame-sequence streaming with loop/FPS controls. `gui_v2`
+  supports animated/streamed backgrounds, but does not yet expose the same
+  finite playback workflow. Decide whether that old workflow is still required
+  or explicitly superseded before closing the GUI parity audit.
+
 ## Confirmed
+
+## Planned
+
+## In progress
+
+The user approved implementation of these scenarios. Widget sizing, precise
+selection, color editing, media placement, and `gui_v2` parity are being worked
+through together. Automated tests do not establish GUI or hardware acceptance.
 
 - [ ] **Maintain `gui_v2` as the active GUI reimplementation** — `th420-config`
   builds from `src/gui_v2.rs`. Retain `src/gui_overhaul.rs` for comparison until
   `gui_v2` has reimplemented every required capability; do not merge the two UIs
   blindly or remove the old implementation prematurely.
 
-## Planned
+  Inventory every user workflow in `gui_overhaul`, every supported runtime
+  config field, and relevant CLI-only device operations. Record the equivalent
+  `gui_v2` control or mark the old workflow as intentionally superseded, with a
+  reason and user-visible replacement. Examine sensor-source editing,
+  Undo/Redo, Profiles, Diagnostics, persistent-media controls, and service
+  management explicitly; do not assume the new widget editor replaces them.
+  Create separate tasks for genuine gaps and add the GUI/config parity check
+  already tracked in Identified. Close this umbrella task only when required
+  gaps have been implemented and the checklist has been reviewed. Keep the
+  old GUI source until that point.
 
-## In progress
+  Progress: `gui_v2` now has source label/unit editing, Profiles, Diagnostics,
+  Undo/Redo, fine display rotation, and daemon restart. Widget instance order
+  supersedes the old layout/sensor-order workflow; template/instance colors
+  supersede sensor-specific colors. The detailed parity inventory, transient
+  Live playback decision, and GUI validation remain open.
+
+- [ ] **Simplify widget sizing and keep geometry stable** — use explicit local
+  box width and height, with template defaults and optional per-instance
+  overrides. Changing telemetry must not resize the text area, background, or
+  selection box. Center the value and label group inside the box, retain their
+  individual font sizes and relative placement, and provide numerical size
+  controls plus a deliberate Fit to content action and overflow warning. Widget
+  placement needs pan and rotation; remove widget-specific zoom and X/Y stretch
+  from the new model and editor. Backwards compatibility for existing widget
+  scale/stretch settings is not required. Background, Boot, and Standby media
+  transforms are unaffected.
+
+  Add width and height to template style and sparse optional width/height
+  overrides to instances. Resolve them once per render from the template and
+  overrides, never from the current telemetry string. Replace the widget's
+  shared `Transform2D` with widget-only pan/rotation placement while retaining
+  `Transform2D` for backgrounds and persistent media. Use one local rectangle
+  for text layout, optional color fill, rendering pivot, and selection. Center
+  the value-and-label group inside the rectangle while retaining its internal
+  label offsets; preserve half-pixel centers through rotation and rasterization.
+  Set built-in dimensions for representative formatted readings. On Add widget,
+  use the selected template dimensions; duplicated instances retain their own
+  overrides. A Fit to content action should measure the label, the current
+  value (or missing-data placeholder), and a representative value for the
+  bound unit, then add explicit padding and set the instance overrides.
+
+  Expose precise numerical width/height controls, inherited/overridden state,
+  Reset to template, and a non-blocking overflow warning when either rendered
+  text exceeds the box. Reject non-finite or non-positive dimensions, and cap
+  raster dimensions before allocation. Widget configs using the old scale and
+  stretch representation need no compatibility migration; document the config
+  schema change. Test inheritance, independent sibling sizing, value changes
+  such as `99` to `100`, Fit to content, overflow, labels above/below values,
+  transparent and opaque backgrounds, rotation pivot, and serialization.
+
+  Progress: template box dimensions, sparse instance overrides, pan/rotation-
+  only widget placement, stable render bounds, numerical size controls,
+  inheritance reset, Fit to content, and overflow warning are implemented.
+  Visual fit/overflow checks and stronger representative-value coverage remain.
+
+- [ ] **Improve color editing across the GUI** — provide a consistent, larger
+  swatch, editable `#RRGGBB` value, and visual picker for widget labels,
+  thresholds, widget backgrounds, and canvas colors. Keep transparency separate
+  where applicable, preserve template inheritance/reset, and handle incomplete
+  or invalid hex input without changing the saved color.
+
+  Implement a reusable RGB editor in `gui_v2` with a larger swatch, a visual
+  hue/saturation/value popup, and a `#RRGGBB` text field. Keep a per-control
+  draft string keyed by a stable widget/template/threshold identity. Accept a
+  complete six-digit hex value on Enter or focus loss; retain invalid or
+  incomplete drafts with inline feedback while leaving the working color
+  unchanged. Changes from the popup update the desktop preview immediately;
+  Apply retains its existing configuration-save semantics. Reuse the editor
+  for template and instance label colors, threshold rows, widget background
+  colors, and Live/Boot/Standby canvas colors. Keep background transparency
+  as its existing separate 0–100% control, converting only at the UI boundary
+  to the stored 0–255 opacity. A color change to an inherited instance creates
+  only that field's override; Use template clears it.
+
+  Test hex parsing/formatting, draft/commit behavior, RGB conversion, opacity
+  endpoint and round-trip behavior, independent fields and threshold rows,
+  template inheritance, and config save/load. Visually check popup sizing,
+  keyboard editing, and preview updates at the GUI boundary.
+
+  Progress: the reusable swatch/hex/popup editor is wired to widget labels,
+  threshold rows, widget backgrounds, and all three canvas colors. Hex parsing
+  has automated tests; keyboard, popup, inheritance, and transparency behavior
+  still need GUI validation.
+
+- [ ] **Select transformed widgets by their actual box** — hit-test the widget's
+  rotated local box rather than its axis-aligned bounding box.
+  Share geometry with rendering and the selection outline, retain topmost-first
+  behavior for overlaps, and allow a small pointer tolerance. This depends on
+  stable widget geometry.
+
+  Derive the four transformed box corners from the resolved local dimensions
+  and widget pan/rotation in one shared geometry helper. Draw the selection
+  outline from those corners. For pointer hit-testing, map the canvas point
+  through the inverse transform into local box coordinates, using a small
+  tolerance measured in preview pixels. Ignore hidden or unrendered instances,
+  inspect remaining instances in reverse compositing order, and keep a drag
+  active once it starts even if the pointer leaves the box. An instance may
+  still be selected from the list when its media is missing or off-screen.
+  Test rotated empty corners, 0/90/180-degree rotations, fractional centers,
+  edge tolerance at different preview sizes, overlaps, and drag continuity.
+
+  Progress: the outline uses rotated box corners; hit testing inverse-rotates
+  the pointer, uses preview-pixel tolerance, and respects visible/rendered
+  instances and reverse z-order. Full interactive selection checks remain.
+
+- [ ] **Bound and align Live, Boot, and Standby media placement** — use the square
+  480×480 canvas for movement limits and edge alignment; the circular display
+  mask remains visual clipping. In the default relaxed mode, allow the actual
+  transformed image or video frame to move completely out of view, but stop
+  when its outer edge touches the canvas edge: do not allow a gap between them.
+  Exclude rotation padding filled with canvas color when determining the media
+  edge. Provide a **Center image** action that resets pan to `(0, 0)` without
+  changing zoom, stretch, or rotation.
+
+  Offer independent, optional edge snapping for Live backgrounds, Boot media,
+  and Standby media. Within its snap distance, alignment of a transformed
+  media edge with a canvas edge takes precedence over pan-grid snapping on the
+  affected axis; otherwise retain grid snapping. Preview coordinates and
+  committed coordinates must obey the same rule. Also offer an optional
+  **Keep viewport covered** mode that prevents any canvas pixel from falling
+  outside the actual transformed media. If the current scale or rotation
+  cannot cover the canvas, explain the conflict and require an explicit size
+  change rather than silently modifying the transform. Apply the limits to
+  pointer drags and numeric pan controls, with consistent bounds across an
+  animation's frames.
+
+  Extract shared media-footprint geometry from the fit, zoom, stretch, and
+  rotation calculations before canvas-colored rotation padding is added. Work
+  with the transformed source rectangle in center-relative canvas coordinates.
+  In relaxed mode, a candidate pan is valid when that rectangle intersects or
+  touches the square canvas; clamp an invalid candidate to the nearest valid
+  contact position so a fully off-screen image cannot move farther away. In
+  strict mode, require all four canvas corners to lie inside that rectangle.
+  If strict coverage is geometrically impossible, leave the current transform
+  intact and explain which size/rotation change is needed. While strict mode
+  is active, reject scale or rotation edits that would make coverage impossible
+  rather than silently changing zoom. Solid-color Live backgrounds have no
+  media edge and should not show these controls.
+
+  Provide separate edge-snap and strict-coverage toggles for Live, Boot, and
+  Standby, preserving the existing independent grid settings. Use an 8 canvas
+  pixel default edge-snap distance. For a rotated rectangle, align its extreme
+  point on the relevant axis to a canvas edge (tangent contact), not its
+  canvas-colored bounding-box padding. Evaluate edge candidates before grid
+  candidates on each axis, then validate the combined candidate against the
+  selected placement mode. If a grid point is illegal, choose the nearest
+  legal boundary position; the final Drag/Preview readout must equal the stored
+  coordinates on release. Changing snap options must never resnap a committed
+  pan. Center image sets only pan to `(0, 0)`.
+
+  Use the same constraint function for desktop dragging, numeric pan, and
+  device-preview/upload arguments. Derive one legal pan region for every
+  animation frame; if source dimensions can differ, use the intersection of
+  their legal regions. Recompute on source or transform changes without silently
+  moving a committed image. Test exact edge contact, one-pixel gaps, all four
+  sides and corners, rotated contact, strict-mode impossibility, edge-versus-
+  grid precedence, snap changes, animation-frame consistency, and desktop/
+  device-preview geometry equivalence. Follow automated checks with visual
+  preview and physical-device validation; do not mark hardware behavior
+  verified from unit tests alone.
+
+  Progress: source-footprint geometry, relaxed/strict pan regions, edge-before-
+  grid snapping, per-target toggles, Center image, drag/numeric bounds, and
+  geometry-edit rejection are implemented. Boot placement now intersects legal
+  regions across differing animation-frame dimensions. GUI Apply, device
+  preview, and persistent-media uploads now validate placement before sending
+  arguments. Remaining: decide whether direct CLI media transforms should
+  enforce the same optional GUI modes, complete coverage tests, and run
+  visual/device checks.
 
 ## Complete
 

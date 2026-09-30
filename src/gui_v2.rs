@@ -1,5 +1,6 @@
 mod config;
 mod instance;
+mod profile;
 mod renderer;
 mod sensors;
 mod service_manager;
@@ -7,7 +8,7 @@ mod service_manager;
 use clap::Parser;
 use config::{
     default_config_path, Config, ImageFit, MediaTransform, Transform2D, WidgetInstance,
-    WidgetOverrides, BUILTIN_SENSOR_TEMPLATE_ID,
+    WidgetOverrides, WidgetPlacement, BUILTIN_SENSOR_TEMPLATE_ID,
 };
 use eframe::egui;
 use image::codecs::gif::GifDecoder;
@@ -16,9 +17,11 @@ use instance::{
     current_owner, refresh_owner, replace_and_acquire, request_daemon_command, request_graceful,
     signal_owner, AcquireError, InstanceGuard, InstanceKind, OwnerInfo, ReplaceExisting,
 };
+use profile::ProfileStore;
 use renderer::{
     arc_pointer_angle, centered_grid_coordinates, load_media_frame_at, media_duration,
-    transform_media_image, DragSnapState, Renderer, RotationDragState, TimedAnimation,
+    transform_media_image, DragSnapState, MediaFootprint, PanRegion, Renderer, RotationDragState,
+    TimedAnimation,
 };
 use sensors::SensorValues;
 use service_manager::ServiceManager;
@@ -37,14 +40,18 @@ enum Page {
     Overview,
     LiveDisplay,
     StandbySettings,
+    Profiles,
+    Diagnostics,
     Settings,
 }
 
 impl Page {
-    const ALL: [(Page, &'static str); 4] = [
+    const ALL: [(Page, &'static str); 6] = [
         (Page::Overview, "Overview"),
         (Page::LiveDisplay, "Live Display"),
         (Page::StandbySettings, "Standby Settings"),
+        (Page::Profiles, "Profiles"),
+        (Page::Diagnostics, "Diagnostics"),
         (Page::Settings, "Settings"),
     ];
 }
@@ -122,6 +129,8 @@ struct SnapSettings {
     show_grid: bool,
     pan_grid: f32,
     rotation_grid: f32,
+    edge_snap: bool,
+    keep_covered: bool,
 }
 
 impl Default for SnapSettings {
@@ -131,6 +140,8 @@ impl Default for SnapSettings {
             show_grid: true,
             pan_grid: 8.0,
             rotation_grid: 15.0,
+            edge_snap: true,
+            keep_covered: false,
         }
     }
 }
@@ -231,6 +242,14 @@ struct App {
     committed: Config,
     working: Config,
     config_path: PathBuf,
+    profiles: ProfileStore,
+    selected_profile: Option<String>,
+    profile_name_edit: String,
+    confirm_delete_profile: bool,
+    undo: Vec<Config>,
+    redo: Vec<Config>,
+    pending_undo: Option<Config>,
+    suppress_history_once: bool,
     renderer: Renderer,
     sensors: sensors::SensorReader,
     sensor_values: SensorValues,
@@ -495,6 +514,8 @@ impl App {
         } else {
             BackgroundSource::SolidColor
         };
+        let profiles = ProfileStore::new();
+        let selected_profile = profiles.active_name();
 
         let (boot_inspection_tx, boot_inspection_rx) = mpsc::channel();
         let (boot_animation_tx, boot_animation_rx) = mpsc::channel();
@@ -515,6 +536,14 @@ impl App {
             committed: config.clone(),
             working: config,
             config_path,
+            profiles,
+            selected_profile,
+            profile_name_edit: String::new(),
+            confirm_delete_profile: false,
+            undo: Vec::new(),
+            redo: Vec::new(),
+            pending_undo: None,
+            suppress_history_once: false,
             renderer: Renderer::new(),
             sensors: sensors::SensorReader::new(),
             sensor_values: SensorValues {
@@ -899,10 +928,35 @@ impl App {
                 .map(|path| path.to_string_lossy().into_owned()),
             BackgroundSource::SolidColor => None,
         };
+        if let Some(source) = self.live_source_dimensions() {
+            if let Some(error) = media_placement_error(
+                Some(source),
+                &self.working.background.fit,
+                &self.working.background.transform(),
+                self.live_snap,
+            ) {
+                self.last_error = Some(format!("Live background placement is invalid: {error}"));
+                return;
+            }
+        }
         match self.working.save(&self.config_path) {
             Ok(()) => {
                 self.committed = self.working.clone();
+                self.undo.clear();
+                self.redo.clear();
+                self.pending_undo = None;
                 self.status_text = "Configuration applied".to_string();
+                if let Some(name) = self.selected_profile.clone() {
+                    if let Err(error) = self
+                        .profiles
+                        .save(&name, &self.working)
+                        .and_then(|_| self.profiles.set_active(&name))
+                    {
+                        self.last_error = Some(format!(
+                            "Configuration applied, but profile update failed: {error}"
+                        ));
+                    }
+                }
             }
             Err(err) => self.last_error = Some(format!("Failed to save config: {err}")),
         }
@@ -910,7 +964,105 @@ impl App {
 
     fn revert(&mut self) {
         self.working = self.committed.clone();
+        self.undo.clear();
+        self.redo.clear();
+        self.pending_undo = None;
+        self.suppress_history_once = true;
+        self.sync_background_source();
         self.selected_sensor = None;
+    }
+
+    fn sync_background_source(&mut self) {
+        self.background_file_path = self.working.background.image_path.clone();
+        self.background_source = match self.background_file_path.as_deref() {
+            None => BackgroundSource::SolidColor,
+            Some(path)
+                if self
+                    .stream_path
+                    .as_ref()
+                    .is_some_and(|stream| stream.to_string_lossy() == path) =>
+            {
+                BackgroundSource::Stream
+            }
+            Some(_) => BackgroundSource::File,
+        };
+        self.preview_texture = None;
+    }
+
+    fn push_undo(&mut self, before: Config) {
+        if before == self.working {
+            return;
+        }
+        if self.undo.last() != Some(&before) {
+            self.undo.push(before);
+            if self.undo.len() > 64 {
+                self.undo.remove(0);
+            }
+        }
+        self.redo.clear();
+    }
+
+    fn undo(&mut self) {
+        if let Some(previous) = self.undo.pop() {
+            self.redo.push(self.working.clone());
+            self.working = previous;
+            self.sync_background_source();
+            self.pending_undo = None;
+            self.suppress_history_once = true;
+        }
+    }
+
+    fn redo(&mut self) {
+        if let Some(next) = self.redo.pop() {
+            self.undo.push(self.working.clone());
+            self.working = next;
+            self.sync_background_source();
+            self.pending_undo = None;
+            self.suppress_history_once = true;
+        }
+    }
+
+    fn capture_history(&mut self, before: Config, ctx: &egui::Context) {
+        if self.suppress_history_once {
+            self.suppress_history_once = false;
+            self.pending_undo = None;
+            return;
+        }
+        let pointer_down = ctx.input(|input| input.pointer.any_down());
+        if before != self.working {
+            if pointer_down {
+                if self.pending_undo.is_none() {
+                    self.pending_undo = Some(before);
+                }
+            } else {
+                let base = self.pending_undo.take().unwrap_or(before);
+                self.push_undo(base);
+            }
+        } else if !pointer_down {
+            if let Some(base) = self.pending_undo.take() {
+                self.push_undo(base);
+            }
+        }
+    }
+
+    fn handle_keyboard(&mut self, ctx: &egui::Context) {
+        if ctx.wants_keyboard_input() {
+            return;
+        }
+        let undo = ctx.input(|input| {
+            input.modifiers.command && input.key_pressed(egui::Key::Z) && !input.modifiers.shift
+        });
+        let redo = ctx.input(|input| {
+            input.modifiers.command
+                && ((input.key_pressed(egui::Key::Z) && input.modifiers.shift)
+                    || input.key_pressed(egui::Key::Y))
+        });
+        if undo {
+            self.undo();
+        }
+        if redo {
+            self.redo();
+        }
     }
 
     fn set_live_display(&mut self, enabled: bool) {
@@ -984,6 +1136,18 @@ impl App {
                                     .small()
                                     .color(egui::Color32::YELLOW),
                             );
+                        }
+                        if ui
+                            .add_enabled(!self.redo.is_empty(), egui::Button::new("Redo"))
+                            .clicked()
+                        {
+                            self.redo();
+                        }
+                        if ui
+                            .add_enabled(!self.undo.is_empty(), egui::Button::new("Undo"))
+                            .clicked()
+                        {
+                            self.undo();
                         }
                     });
                 });
@@ -1230,20 +1394,32 @@ impl App {
                 delta.x * 480.0 / rect.width(),
                 delta.y * 480.0 / rect.height(),
             ];
+            let source = self.live_source_dimensions();
             let drag = self.background_drag.get_or_insert_with(|| {
                 DragSnapState::new([self.working.background.pan_x, self.working.background.pan_y])
             });
-            drag.update(
-                canvas_delta,
-                self.live_snap.enabled,
-                self.live_snap.pan_grid,
-            );
+            drag.update(canvas_delta, false, self.live_snap.pan_grid);
+            let transform = self.working.background.transform();
+            if let Ok(preview) = constrained_media_pan(
+                source,
+                &self.working.background.fit,
+                &transform,
+                drag.raw,
+                self.live_snap,
+                true,
+            ) {
+                drag.preview = preview;
+            }
             self.working.background.pan_x = drag.preview[0];
             self.working.background.pan_y = drag.preview[1];
         }
         if response.drag_stopped_by(egui::PointerButton::Primary) {
             if let Some(drag) = self.background_drag.take() {
-                let committed = drag.finish(self.live_snap.enabled, self.live_snap.pan_grid);
+                let committed = if drag.moved() {
+                    drag.preview
+                } else {
+                    drag.origin
+                };
                 self.working.background.pan_x = committed[0];
                 self.working.background.pan_y = committed[1];
             }
@@ -1269,6 +1445,7 @@ impl App {
             });
         }
         if response.dragged_by(egui::PointerButton::Secondary) {
+            let source = self.live_source_dimensions();
             if let (Some(pointer), Some(drag)) = (
                 response.interact_pointer_pos(),
                 self.background_rotation_drag.as_mut(),
@@ -1279,14 +1456,36 @@ impl App {
                     rect.width() * 0.08,
                 ) {
                     drag.update(angle, self.live_snap.enabled, self.live_snap.rotation_grid);
-                    self.working.background.rotation = drag.preview;
+                    let mut candidate = self.working.background.transform();
+                    candidate.rotation = drag.preview;
+                    if let Some(error) = media_placement_error(
+                        source,
+                        &self.working.background.fit,
+                        &candidate,
+                        self.live_snap,
+                    ) {
+                        self.last_error = Some(error);
+                    } else {
+                        self.working.background.rotation = drag.preview;
+                    }
                 }
             }
         }
         if response.drag_stopped_by(egui::PointerButton::Secondary) {
             if let Some(drag) = self.background_rotation_drag.take() {
-                self.working.background.rotation =
+                let mut candidate = self.working.background.transform();
+                candidate.rotation =
                     drag.finish(self.live_snap.enabled, self.live_snap.rotation_grid);
+                if media_placement_error(
+                    self.live_source_dimensions(),
+                    &self.working.background.fit,
+                    &candidate,
+                    self.live_snap,
+                )
+                .is_none()
+                {
+                    self.working.background.rotation = candidate.rotation;
+                }
             }
         }
         if let Some(drag) = self.background_rotation_drag {
@@ -1302,8 +1501,18 @@ impl App {
         if response.hovered() {
             let scroll = ctx.input(|input| input.raw_scroll_delta.y);
             if scroll != 0.0 {
-                self.working.background.zoom =
-                    (self.working.background.zoom * (1.0 + scroll * 0.001)).clamp(0.05, 8.0);
+                let mut candidate = self.working.background.transform();
+                candidate.zoom = (candidate.zoom * (1.0 + scroll * 0.001)).clamp(0.05, 8.0);
+                if let Some(error) = media_placement_error(
+                    self.live_source_dimensions(),
+                    &self.working.background.fit,
+                    &candidate,
+                    self.live_snap,
+                ) {
+                    self.last_error = Some(error);
+                } else {
+                    self.working.background.zoom = candidate.zoom;
+                }
             }
         }
     }
@@ -1313,6 +1522,14 @@ impl App {
             PreviewMode::Boot => &self.boot_transform,
             PreviewMode::Standby => &self.standby_transform,
         }
+    }
+
+    fn live_source_dimensions(&self) -> Option<(u32, u32)> {
+        self.working
+            .background
+            .image_path
+            .as_deref()
+            .and_then(|path| self.renderer.background_source_dimensions(path))
     }
 
     fn active_media_transform_mut(&mut self) -> &mut MediaTransform {
@@ -1343,21 +1560,29 @@ impl App {
         }
     }
 
-    fn boot_source_dimensions(&self) -> Option<(u32, u32)> {
-        let path = self.boot_path.as_ref()?;
+    fn boot_source_dimensions_all(&self) -> Vec<(u32, u32)> {
+        let Some(path) = self.boot_path.as_ref() else {
+            return Vec::new();
+        };
         if let Some((_, animation)) = self
             .boot_animation
             .as_ref()
             .filter(|(animation_path, _)| animation_path == path)
         {
-            return animation
-                .frame(0)
-                .map(|frame| (frame.width(), frame.height()));
+            return animation.frame_dimensions();
         }
         self.boot_source_cache
             .as_ref()
             .filter(|(cached_path, _)| cached_path == path)
-            .map(|(_, frame)| (frame.width(), frame.height()))
+            .map(|(_, frame)| vec![(frame.width(), frame.height())])
+            .unwrap_or_default()
+    }
+
+    fn active_media_source_dimensions(&self) -> Vec<(u32, u32)> {
+        match self.preview_mode {
+            PreviewMode::Boot => self.boot_source_dimensions_all(),
+            PreviewMode::Standby => self.standby_source_dimensions().into_iter().collect(),
+        }
     }
 
     fn standby_source_dimensions(&self) -> Option<(u32, u32)> {
@@ -1407,19 +1632,30 @@ impl App {
                 [transform.pan_x, transform.pan_y]
             };
             let snap = self.active_media_snap();
-            let drag = self
-                .active_media_drag_mut()
-                .get_or_insert_with(|| DragSnapState::new(origin));
-            drag.update(canvas_delta, snap.enabled, snap.pan_grid);
-            let preview = drag.preview;
+            let raw = {
+                let drag = self
+                    .active_media_drag_mut()
+                    .get_or_insert_with(|| DragSnapState::new(origin));
+                drag.update(canvas_delta, false, snap.pan_grid);
+                drag.raw
+            };
+            let sources = self.active_media_source_dimensions();
+            let media = self.active_media_transform();
+            let preview =
+                constrained_media_pan_many(&sources, &media.fit, &media.transform, raw, snap, true)
+                    .unwrap_or(raw);
+            self.active_media_drag_mut().as_mut().unwrap().preview = preview;
             let transform = &mut self.active_media_transform_mut().transform;
             transform.pan_x = preview[0];
             transform.pan_y = preview[1];
         }
         if response.drag_stopped_by(egui::PointerButton::Primary) {
-            let snap = self.active_media_snap();
             if let Some(drag) = self.active_media_drag_mut().take() {
-                let committed = drag.finish(snap.enabled, snap.pan_grid);
+                let committed = if drag.moved() {
+                    drag.preview
+                } else {
+                    drag.origin
+                };
                 let transform = &mut self.active_media_transform_mut().transform;
                 transform.pan_x = committed[0];
                 transform.pan_y = committed[1];
@@ -1463,7 +1699,17 @@ impl App {
                         None
                     };
                     if let Some(preview) = preview {
-                        self.active_media_transform_mut().transform.rotation = preview;
+                        let sources = self.active_media_source_dimensions();
+                        let media = self.active_media_transform().clone();
+                        let mut candidate = media.transform;
+                        candidate.rotation = preview;
+                        if let Some(error) =
+                            media_placement_error_many(&sources, &media.fit, &candidate, snap)
+                        {
+                            self.last_error = Some(error);
+                        } else {
+                            self.active_media_transform_mut().transform.rotation = preview;
+                        }
                     }
                 }
             }
@@ -1472,7 +1718,13 @@ impl App {
             let snap = self.active_media_snap();
             if let Some(drag) = self.active_media_rotation_drag_mut().take() {
                 let committed = drag.finish(snap.enabled, snap.rotation_grid);
-                self.active_media_transform_mut().transform.rotation = committed;
+                let sources = self.active_media_source_dimensions();
+                let media = self.active_media_transform().clone();
+                let mut candidate = media.transform;
+                candidate.rotation = committed;
+                if media_placement_error_many(&sources, &media.fit, &candidate, snap).is_none() {
+                    self.active_media_transform_mut().transform.rotation = committed;
+                }
                 self.device_preview_refresh_now = true;
             }
         }
@@ -1489,8 +1741,20 @@ impl App {
         if response.hovered() {
             let scroll = ctx.input(|input| input.raw_scroll_delta.y);
             if scroll != 0.0 {
-                let transform = &mut self.active_media_transform_mut().transform;
-                transform.zoom = (transform.zoom * (1.0 + scroll * 0.001)).clamp(0.05, 8.0);
+                let sources = self.active_media_source_dimensions();
+                let media = self.active_media_transform().clone();
+                let mut candidate = media.transform;
+                candidate.zoom = (candidate.zoom * (1.0 + scroll * 0.001)).clamp(0.05, 8.0);
+                if let Some(error) = media_placement_error_many(
+                    &sources,
+                    &media.fit,
+                    &candidate,
+                    self.active_media_snap(),
+                ) {
+                    self.last_error = Some(error);
+                } else {
+                    self.active_media_transform_mut().transform.zoom = candidate.zoom;
+                }
             }
         }
     }
@@ -1525,11 +1789,12 @@ impl App {
             ]
         });
         if response.clicked_by(egui::PointerButton::Primary) {
-            self.selected_sensor = pointer_canvas.and_then(|point| self.widget_at(point));
+            self.selected_sensor =
+                pointer_canvas.and_then(|point| self.widget_at(point, 4.0 * 480.0 / rect.width()));
         }
         if response.drag_started_by(egui::PointerButton::Primary) {
             if let Some(point) = pointer_canvas {
-                if let Some(id) = self.widget_at(point) {
+                if let Some(id) = self.widget_at(point, 4.0 * 480.0 / rect.width()) {
                     self.selected_sensor = Some(id.clone());
                     if let Some(instance) = self
                         .working
@@ -1664,20 +1929,22 @@ impl App {
                     rect.center().x + instance.transform.pan_x * rect.width() / 480.0,
                     rect.center().y + instance.transform.pan_y * rect.height() / 480.0,
                 );
-                let bounds = self
-                    .renderer
-                    .widget_bounds(&self.working, id, &self.sensor_values)
-                    .unwrap_or([60.0, 60.0]);
-                let size = egui::vec2(
-                    bounds[0] * rect.width() / 480.0,
-                    bounds[1] * rect.height() / 480.0,
-                );
-                ui.painter().rect_stroke(
-                    egui::Rect::from_center_size(point, size),
-                    0.0,
-                    egui::Stroke::new(2.0_f32, egui::Color32::YELLOW),
-                    egui::StrokeKind::Outside,
-                );
+                let _ = point;
+                if let Some(corners) = self.renderer.widget_corners(&self.working, id) {
+                    let points: Vec<egui::Pos2> = corners
+                        .iter()
+                        .map(|[x, y]| {
+                            egui::pos2(
+                                rect.center().x + x * rect.width() / 480.0,
+                                rect.center().y + y * rect.height() / 480.0,
+                            )
+                        })
+                        .collect();
+                    ui.painter().add(egui::Shape::closed_line(
+                        points,
+                        egui::Stroke::new(2.0_f32, egui::Color32::YELLOW),
+                    ));
+                }
             }
         }
         if let Some(drag) = self.widget_drag {
@@ -1702,21 +1969,21 @@ impl App {
         }
     }
 
-    fn widget_at(&self, point: [f32; 2]) -> Option<String> {
+    fn widget_at(&self, point: [f32; 2], tolerance: f32) -> Option<String> {
         self.working
             .widget_instances
             .iter()
             .rev()
-            .filter(|instance| instance.visible)
+            .filter(|instance| instance.visible && self.working.overlay_enabled)
             .filter_map(|instance| {
-                let dx = instance.transform.pan_x - point[0];
-                let dy = instance.transform.pan_y - point[1];
-                let bounds = self.renderer.widget_bounds(
-                    &self.working,
-                    &instance.id,
-                    &self.sensor_values,
-                )?;
-                (dx.abs() <= bounds[0] / 2.0 && dy.abs() <= bounds[1] / 2.0)
+                let widget = self.working.resolved_widget(instance)?;
+                if !self.sensor_values.readings.contains_key(&widget.source_id)
+                    && !widget.style.show_missing
+                {
+                    return None;
+                }
+                self.renderer
+                    .widget_contains(&self.working, &instance.id, point, tolerance)
                     .then(|| instance.id.clone())
             })
             .next()
@@ -1942,20 +2209,20 @@ impl App {
         }
         ui.horizontal(|ui| {
             ui.label("Canvas color");
-            let mut color = self
-                .working
-                .background
-                .background_color
-                .map(|channel| channel as f32 / 255.0);
-            if egui::color_picker::color_edit_button_rgb(ui, &mut color).changed() {
-                self.working.background.background_color =
-                    color.map(|channel| (channel * 255.0).round().clamp(0.0, 255.0) as u8);
-            }
+            rgb_editor(
+                ui,
+                "live-canvas",
+                &mut self.working.background.background_color,
+            );
         });
         self.background_transform_controls(ui);
     }
 
     fn background_transform_controls(&mut self, ui: &mut egui::Ui) {
+        let before = self.working.background.transform();
+        let covered_before = self.live_snap.keep_covered;
+        let source_dimensions = self.live_source_dimensions();
+        let mut pan_edited = false;
         ui.separator();
         ui.label(egui::RichText::new("Transform").strong());
         if self.background_source != BackgroundSource::SolidColor {
@@ -2025,6 +2292,18 @@ impl App {
                     .suffix(" deg"),
             );
         });
+        if self.background_source != BackgroundSource::SolidColor {
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.live_snap.edge_snap, "Snap media edges (8 px)");
+                ui.checkbox(&mut self.live_snap.keep_covered, "Keep viewport covered");
+                if ui.small_button("Center image").clicked() {
+                    self.working.background.pan_x = 0.0;
+                    self.working.background.pan_y = 0.0;
+                    self.background_drag = None;
+                    pan_edited = true;
+                }
+            });
+        }
         ui.add(egui::Slider::new(&mut self.working.background.zoom, 0.05..=8.0).text("Zoom"));
         ui.horizontal(|ui| {
             ui.label("Stretch");
@@ -2059,6 +2338,7 @@ impl App {
                 .changed();
             if pan_x_changed || pan_y_changed {
                 self.background_drag = None;
+                pan_edited = true;
             }
         });
         ui.horizontal(|ui| {
@@ -2085,6 +2365,51 @@ impl App {
             egui::Slider::new(&mut self.working.background.overlay_alpha, 0..=255).text("Darken"),
         );
         ui.add(egui::Slider::new(&mut self.working.background.blur_sigma, 0.0..=50.0).text("Blur"));
+        if self.background_source != BackgroundSource::SolidColor {
+            let current = self.working.background.transform();
+            let geometry_changed = current.zoom != before.zoom
+                || current.stretch_x != before.stretch_x
+                || current.stretch_y != before.stretch_y
+                || current.rotation != before.rotation;
+            if let Some(source) = source_dimensions {
+                if pan_edited {
+                    let transform = self.working.background.transform();
+                    if let Ok([x, y]) = constrained_media_pan(
+                        Some(source),
+                        &self.working.background.fit,
+                        &transform,
+                        [transform.pan_x, transform.pan_y],
+                        self.live_snap,
+                        false,
+                    ) {
+                        self.working.background.pan_x = x;
+                        self.working.background.pan_y = y;
+                    }
+                }
+                let current = self.working.background.transform();
+                let placement_error = (geometry_changed
+                    || covered_before != self.live_snap.keep_covered)
+                    .then(|| {
+                        media_placement_error(
+                            Some(source),
+                            &self.working.background.fit,
+                            &current,
+                            self.live_snap,
+                        )
+                    })
+                    .flatten();
+                if let Some(error) = placement_error {
+                    if geometry_changed {
+                        self.working.background.zoom = before.zoom;
+                        self.working.background.stretch_x = before.stretch_x;
+                        self.working.background.stretch_y = before.stretch_y;
+                        self.working.background.rotation = before.rotation;
+                    }
+                    self.live_snap.keep_covered = covered_before;
+                    self.last_error = Some(error);
+                }
+            }
+        }
     }
 
     fn show_overlay_editor(&mut self, ui: &mut egui::Ui) {
@@ -2122,7 +2447,7 @@ impl App {
                         template_id: self.add_widget_template.clone(),
                         source_id: source.id.clone(),
                         visible: true,
-                        transform: Transform2D::default(),
+                        transform: WidgetPlacement::default(),
                         overrides: WidgetOverrides::default(),
                     });
                     self.selected_sensor = Some(id);
@@ -2245,6 +2570,66 @@ impl App {
                         }
                     });
                 if let Some(resolved) = resolved {
+                    ui.horizontal(|ui| {
+                        ui.label("Box size");
+                        let mut width = instance.overrides.width.unwrap_or(resolved.style.width);
+                        let mut height = instance.overrides.height.unwrap_or(resolved.style.height);
+                        if ui
+                            .add(
+                                egui::DragValue::new(&mut width)
+                                    .range(1.0..=4096.0)
+                                    .prefix("W: ")
+                                    .suffix(" px"),
+                            )
+                            .changed()
+                            && width.is_finite()
+                        {
+                            instance.overrides.width = Some(width);
+                        }
+                        if ui
+                            .add(
+                                egui::DragValue::new(&mut height)
+                                    .range(1.0..=4096.0)
+                                    .prefix("H: ")
+                                    .suffix(" px"),
+                            )
+                            .changed()
+                            && height.is_finite()
+                        {
+                            instance.overrides.height = Some(height);
+                        }
+                        if (instance.overrides.width.is_some()
+                            || instance.overrides.height.is_some())
+                            && ui.small_button("Use template size").clicked()
+                        {
+                            instance.overrides.width = None;
+                            instance.overrides.height = None;
+                        }
+                    });
+                    let current = self
+                        .sensor_values
+                        .readings
+                        .get(&resolved.source_id)
+                        .copied()
+                        .map(|value| renderer::format_value(&resolved.unit, value))
+                        .unwrap_or_else(|| "--".to_string());
+                    let representative = renderer::format_value(&resolved.unit, 100.0);
+                    let required = [current.as_str(), representative.as_str(), "--"]
+                        .into_iter()
+                        .filter_map(|value| self.renderer.widget_content_size(&resolved, value))
+                        .fold([0.0_f32, 0.0_f32], |size, item| {
+                            [size[0].max(item[0]), size[1].max(item[1])]
+                        });
+                    if ui.small_button("Fit to content").clicked() {
+                        instance.overrides.width = Some(required[0].ceil().clamp(1.0, 4096.0));
+                        instance.overrides.height = Some(required[1].ceil().clamp(1.0, 4096.0));
+                    }
+                    if required[0] > resolved.style.width || required[1] > resolved.style.height {
+                        ui.label(
+                            egui::RichText::new("Text may overflow the widget box")
+                                .color(egui::Color32::YELLOW),
+                        );
+                    }
                     override_text_row(ui, "Label", &resolved.label, &mut instance.overrides.label);
                     override_text_row(ui, "Unit", &resolved.unit, &mut instance.overrides.unit);
                     override_f32_row(
@@ -2266,7 +2651,23 @@ impl App {
                         "Label text color",
                         resolved.style.label_color,
                         &mut instance.overrides.label_color,
+                        &instance.id,
                     );
+                    ui.collapsing("Background", |ui| {
+                        override_rgb_row(
+                            ui,
+                            "Color",
+                            resolved.style.background_color,
+                            &mut instance.overrides.background_color,
+                            &instance.id,
+                        );
+                        override_background_transparency_row(
+                            ui,
+                            resolved.style.background_opacity,
+                            &mut instance.overrides.background_opacity,
+                        );
+                        ui.label("100% transparency hides the background.");
+                    });
                     ui.collapsing("Value text colors", |ui| {
                         if instance.overrides.color_map.is_none()
                             && ui.button("Override template thresholds").clicked()
@@ -2274,7 +2675,7 @@ impl App {
                             instance.overrides.color_map = Some(resolved.style.color_map.clone());
                         }
                         if let Some(map) = &mut instance.overrides.color_map {
-                            color_map_editor(ui, map);
+                            color_map_editor(ui, map, &instance.id);
                             if ui.small_button("Use template thresholds").clicked() {
                                 instance.overrides.color_map = None;
                             }
@@ -2292,18 +2693,6 @@ impl App {
                         ui.label("Pan");
                         ui.add(egui::DragValue::new(&mut instance.transform.pan_x).prefix("X: "));
                         ui.add(egui::DragValue::new(&mut instance.transform.pan_y).prefix("Y: "));
-                    });
-                    ui.add(
-                        egui::Slider::new(&mut instance.transform.zoom, 0.05..=8.0).text("Zoom"),
-                    );
-                    ui.horizontal(|ui| {
-                        ui.label("Stretch");
-                        ui.add(
-                            egui::DragValue::new(&mut instance.transform.stretch_x).prefix("X: "),
-                        );
-                        ui.add(
-                            egui::DragValue::new(&mut instance.transform.stretch_y).prefix("Y: "),
-                        );
                     });
                     ui.add(
                         egui::DragValue::new(&mut instance.transform.rotation)
@@ -2331,6 +2720,34 @@ impl App {
         });
 
         self.show_template_manager(ui);
+        self.show_source_editor(ui);
+    }
+
+    fn show_source_editor(&mut self, ui: &mut egui::Ui) {
+        ui.collapsing("Data sources", |ui| {
+            ui.label(egui::RichText::new("Source names and units provide widget defaults. Widget visibility and order are controlled by the instance list; colors are controlled by templates or instance overrides.").small().color(egui::Color32::GRAY));
+            let defaults = Config::default();
+            egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                for source in &mut self.working.sensors {
+                    let current = self.sensor_values.readings.get(&source.id).copied();
+                    ui.collapsing(format!("{} · {}", source.label, source.id), |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("Label");
+                            ui.text_edit_singleline(&mut source.label);
+                            ui.label("Unit");
+                            ui.text_edit_singleline(&mut source.unit);
+                            if ui.small_button("Reset source").clicked() {
+                                if let Some(default) = defaults.sensor_by_id(&source.id) {
+                                    source.label = default.label.clone();
+                                    source.unit = default.unit.clone();
+                                }
+                            }
+                        });
+                        ui.label(current.map(|value| renderer::format_value(&source.unit, value)).unwrap_or_else(|| "No reading yet".into()));
+                    });
+                }
+            });
+        });
     }
 
     fn show_template_manager(&mut self, ui: &mut egui::Ui) {
@@ -2391,6 +2808,21 @@ impl App {
                     egui::Slider::new(&mut template.style.label_font_size, 6.0..=96.0)
                         .text("Label size"),
                 );
+                ui.horizontal(|ui| {
+                    ui.label("Box size");
+                    ui.add(
+                        egui::DragValue::new(&mut template.style.width)
+                            .range(1.0..=4096.0)
+                            .prefix("W: ")
+                            .suffix(" px"),
+                    );
+                    ui.add(
+                        egui::DragValue::new(&mut template.style.height)
+                            .range(1.0..=4096.0)
+                            .prefix("H: ")
+                            .suffix(" px"),
+                    );
+                });
                 ui.add(
                     egui::DragValue::new(&mut template.style.label_offset_y)
                         .prefix("Label Y: ")
@@ -2398,17 +2830,21 @@ impl App {
                 );
                 ui.horizontal(|ui| {
                     ui.label("Label color");
-                    let mut color = template
-                        .style
-                        .label_color
-                        .map(|channel| channel as f32 / 255.0);
-                    if egui::color_picker::color_edit_button_rgb(ui, &mut color).changed() {
-                        template.style.label_color =
-                            color.map(|channel| (channel * 255.0).round().clamp(0.0, 255.0) as u8);
-                    }
+                    rgb_editor(ui, (&template.id, "label"), &mut template.style.label_color);
+                });
+                ui.collapsing("Background", |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Color");
+                        rgb_editor(
+                            ui,
+                            (&template.id, "background"),
+                            &mut template.style.background_color,
+                        );
+                    });
+                    background_transparency_slider(ui, &mut template.style.background_opacity);
                 });
                 ui.collapsing("Default threshold colors", |ui| {
-                    color_map_editor(ui, &mut template.style.color_map);
+                    color_map_editor(ui, &mut template.style.color_map, &template.id);
                 });
             }
             ui.horizontal(|ui| {
@@ -2597,14 +3033,15 @@ impl App {
                 .color(egui::Color32::GRAY),
             );
         }
-        let source_dimensions = self.boot_source_dimensions();
+        let source_dimensions = self.boot_source_dimensions_all();
         if let Some(error) = Self::media_transform_controls(
             ui,
+            "boot",
             &mut self.boot_transform,
             &mut self.boot_drag,
             &mut self.boot_rotation_drag,
             &mut self.boot_snap,
-            source_dimensions,
+            &source_dimensions,
         ) {
             self.last_error = Some(error);
         }
@@ -2646,6 +3083,15 @@ impl App {
             )
             .clicked()
         {
+            if let Some(error) = media_placement_error_many(
+                &source_dimensions,
+                &self.boot_transform.fit,
+                &self.boot_transform.transform,
+                self.boot_snap,
+            ) {
+                self.last_error = Some(format!("Boot upload placement is invalid: {error}"));
+                return;
+            }
             let path = self
                 .boot_path
                 .as_ref()
@@ -2698,14 +3144,15 @@ impl App {
                     .color(egui::Color32::GRAY),
             );
         }
-        let source_dimensions = self.standby_source_dimensions();
+        let source_dimensions: Vec<_> = self.standby_source_dimensions().into_iter().collect();
         if let Some(error) = Self::media_transform_controls(
             ui,
+            "standby",
             &mut self.standby_transform,
             &mut self.standby_drag,
             &mut self.standby_rotation_drag,
             &mut self.standby_snap,
-            source_dimensions,
+            &source_dimensions,
         ) {
             self.last_error = Some(error);
         }
@@ -2723,6 +3170,15 @@ impl App {
             )
             .clicked()
         {
+            if let Some(error) = media_placement_error_many(
+                &source_dimensions,
+                &self.standby_transform.fit,
+                &self.standby_transform.transform,
+                self.standby_snap,
+            ) {
+                self.last_error = Some(format!("Standby upload placement is invalid: {error}"));
+                return;
+            }
             let path = self
                 .standby_path
                 .as_ref()
@@ -2738,13 +3194,18 @@ impl App {
 
     fn media_transform_controls(
         ui: &mut egui::Ui,
+        target: &str,
         media: &mut MediaTransform,
         drag: &mut Option<DragSnapState>,
         rotation_drag: &mut Option<RotationDragState>,
         snap: &mut SnapSettings,
-        source_dimensions: Option<(u32, u32)>,
+        source_dimensions_all: &[(u32, u32)],
     ) -> Option<String> {
+        let source_dimensions = source_dimensions_all.first().copied();
         let mut error = None;
+        let before = media.transform;
+        let covered_before = snap.keep_covered;
+        let mut pan_edited = false;
         ui.separator();
         ui.label(egui::RichText::new("Transform").strong());
         ui.horizontal(|ui| {
@@ -2799,6 +3260,16 @@ impl App {
                     .suffix(" deg"),
             );
         });
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut snap.edge_snap, "Snap media edges (8 px)");
+            ui.checkbox(&mut snap.keep_covered, "Keep viewport covered");
+            if ui.small_button("Center image").clicked() {
+                media.transform.pan_x = 0.0;
+                media.transform.pan_y = 0.0;
+                *drag = None;
+                pan_edited = true;
+            }
+        });
         ui.add(egui::Slider::new(&mut media.transform.zoom, 0.05..=8.0).text("Zoom"));
         ui.horizontal(|ui| {
             ui.label("Stretch");
@@ -2833,6 +3304,7 @@ impl App {
                 .changed();
             if x_changed || y_changed {
                 *drag = None;
+                pan_edited = true;
             }
         });
         ui.horizontal(|ui| {
@@ -2850,12 +3322,45 @@ impl App {
         });
         ui.horizontal(|ui| {
             ui.label("Canvas color");
-            let mut color = media.canvas_color.map(|channel| channel as f32 / 255.0);
-            if egui::color_picker::color_edit_button_rgb(ui, &mut color).changed() {
-                media.canvas_color =
-                    color.map(|channel| (channel * 255.0).round().clamp(0.0, 255.0) as u8);
-            }
+            rgb_editor(ui, (target, "canvas"), &mut media.canvas_color);
         });
+        if !source_dimensions_all.is_empty() {
+            let current = media.transform;
+            let geometry_changed = current.zoom != before.zoom
+                || current.stretch_x != before.stretch_x
+                || current.stretch_y != before.stretch_y
+                || current.rotation != before.rotation;
+            if pan_edited {
+                let transform = media.transform;
+                if let Ok([x, y]) = constrained_media_pan_many(
+                    source_dimensions_all,
+                    &media.fit,
+                    &transform,
+                    [transform.pan_x, transform.pan_y],
+                    *snap,
+                    false,
+                ) {
+                    media.transform.pan_x = x;
+                    media.transform.pan_y = y;
+                }
+            }
+            let current = media.transform;
+            let placement_error = (geometry_changed || covered_before != snap.keep_covered)
+                .then(|| {
+                    media_placement_error_many(source_dimensions_all, &media.fit, &current, *snap)
+                })
+                .flatten();
+            if let Some(message) = placement_error {
+                if geometry_changed {
+                    media.transform.zoom = before.zoom;
+                    media.transform.stretch_x = before.stretch_x;
+                    media.transform.stretch_y = before.stretch_y;
+                    media.transform.rotation = before.rotation;
+                }
+                snap.keep_covered = covered_before;
+                error = Some(message);
+            }
+        }
         error
     }
 
@@ -2875,6 +3380,11 @@ impl App {
                         );
                     }
                 });
+            ui.add(
+                egui::Slider::new(&mut self.working.rotation, 0.0..=359.9)
+                    .text("Fine rotation")
+                    .suffix("°"),
+            );
         });
         ui.add_space(8.0);
         ui.group(|ui| {
@@ -2895,6 +3405,10 @@ impl App {
                 "Service manager: {}",
                 self.service_manager.kind().name()
             ));
+            if self.daemon_running && ui.button("Restart Live Display daemon").clicked() {
+                self.service_manager.restart(&daemon_binary_path());
+                self.daemon_running = self.service_manager.daemon_running();
+            }
         });
         ui.add_space(8.0);
         ui.group(|ui| {
@@ -2911,6 +3425,253 @@ impl App {
             if ui.button("Reset working configuration").clicked() {
                 self.working = Config::default();
                 self.selected_sensor = None;
+            }
+        });
+    }
+
+    fn show_profiles(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Profiles");
+        ui.label("Profiles store runtime display configuration; Boot and Standby uploads remain separate.");
+        let names = match self.profiles.list() {
+            Ok(names) => names,
+            Err(error) => {
+                self.last_error = Some(format!("Failed to list profiles: {error}"));
+                Vec::new()
+            }
+        };
+        egui::ComboBox::from_label("Profile")
+            .selected_text(self.selected_profile.as_deref().unwrap_or("None"))
+            .show_ui(ui, |ui| {
+                for name in &names {
+                    ui.selectable_value(&mut self.selected_profile, Some(name.clone()), name);
+                }
+            });
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(self.selected_profile.is_some(), egui::Button::new("Load"))
+                .clicked()
+            {
+                if let Some(name) = &self.selected_profile {
+                    match self.profiles.load(name) {
+                        Ok(config) => {
+                            self.working = config;
+                            self.selected_sensor = None;
+                            self.sync_background_source();
+                        }
+                        Err(error) => {
+                            self.last_error = Some(format!("Failed to load profile: {error}"))
+                        }
+                    }
+                }
+            }
+            if ui
+                .add_enabled(
+                    self.selected_profile.is_some(),
+                    egui::Button::new("Delete…"),
+                )
+                .clicked()
+            {
+                self.confirm_delete_profile = true;
+            }
+        });
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label("Name");
+            ui.text_edit_singleline(&mut self.profile_name_edit);
+            if ui.button("Save as new").clicked() {
+                let name = ProfileStore::sanitize_name(&self.profile_name_edit);
+                if names.contains(&name) {
+                    self.last_error = Some(format!("Profile {name} already exists"));
+                } else {
+                    match self.profiles.save(&name, &self.working) {
+                        Ok(()) => {
+                            self.selected_profile = Some(name.clone());
+                            self.profile_name_edit = name;
+                        }
+                        Err(error) => {
+                            self.last_error = Some(format!("Failed to save profile: {error}"))
+                        }
+                    }
+                }
+            }
+            if ui
+                .add_enabled(
+                    self.selected_profile.is_some(),
+                    egui::Button::new("Rename selected"),
+                )
+                .clicked()
+            {
+                if let Some(old) = self.selected_profile.clone() {
+                    let name = ProfileStore::sanitize_name(&self.profile_name_edit);
+                    if name != old && names.contains(&name) {
+                        self.last_error = Some(format!("Profile {name} already exists"));
+                    } else if name != old {
+                        match self.profiles.rename(&old, &name) {
+                            Ok(()) => self.selected_profile = Some(name),
+                            Err(error) => {
+                                self.last_error = Some(format!("Failed to rename profile: {error}"))
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        ui.horizontal(|ui| {
+            if ui.button("Import…").clicked() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("TH420 profile", &["toml"])
+                    .pick_file()
+                {
+                    match self.profiles.import(&path) {
+                        Ok((name, config)) => {
+                            self.selected_profile = Some(name);
+                            self.working = config;
+                            self.selected_sensor = None;
+                            self.sync_background_source();
+                        }
+                        Err(error) => {
+                            self.last_error = Some(format!("Profile import failed: {error}"))
+                        }
+                    }
+                }
+            }
+            if ui
+                .add_enabled(
+                    self.selected_profile.is_some(),
+                    egui::Button::new("Export…"),
+                )
+                .clicked()
+            {
+                if let Some(name) = &self.selected_profile {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .set_file_name(format!("{name}.toml"))
+                        .save_file()
+                    {
+                        if let Err(error) = self.profiles.export(name, &path) {
+                            self.last_error = Some(format!("Profile export failed: {error}"));
+                        }
+                    }
+                }
+            }
+            if ui.button("Open profile directory").clicked() {
+                open_local_path(self.profiles.dir());
+            }
+        });
+        if let Some(active) = self.profiles.active_name() {
+            ui.label(format!("Active profile: {active}"));
+        }
+        ui.label(
+            egui::RichText::new("Applying while a profile is selected also updates that profile.")
+                .small()
+                .color(egui::Color32::GRAY),
+        );
+        if self.confirm_delete_profile {
+            egui::Window::new("Delete profile?")
+                .collapsible(false)
+                .resizable(false)
+                .show(ui.ctx(), |ui| {
+                    ui.label(format!(
+                        "Delete profile {}?",
+                        self.selected_profile.as_deref().unwrap_or("")
+                    ));
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel").clicked() {
+                            self.confirm_delete_profile = false;
+                        }
+                        if ui.button("Delete").clicked() {
+                            if let Some(name) = self.selected_profile.clone() {
+                                match self.profiles.delete(&name) {
+                                    Ok(()) => self.selected_profile = None,
+                                    Err(error) => {
+                                        self.last_error =
+                                            Some(format!("Failed to delete profile: {error}"))
+                                    }
+                                }
+                            }
+                            self.confirm_delete_profile = false;
+                        }
+                    });
+                });
+        }
+    }
+
+    fn diagnostics_text(&self) -> String {
+        let mut output = String::from("TH420 Display diagnostics\n\n");
+        output.push_str(&format!(
+            "device.connected={}\ndevice.usb_id={}:{}\n",
+            self.device_info.connected, self.device_info.vid, self.device_info.pid
+        ));
+        output.push_str(&format!(
+            "device.product={}\ndevice.revision={}\n",
+            self.device_info.product.as_deref().unwrap_or("unknown"),
+            self.device_info.revision.as_deref().unwrap_or("unknown")
+        ));
+        output.push_str(&format!(
+            "device.control_hid={}\ndevice.image_hid={}\n",
+            path_or_dash(self.device_info.control_hidraw.as_ref()),
+            path_or_dash(self.device_info.image_hidraw.as_ref())
+        ));
+        output.push_str(&format!(
+            "service.manager={}\nservice.daemon_running={}\nservice.daemon_paused={}\n",
+            self.service_manager.kind().name(),
+            self.daemon_running,
+            self.daemon_paused
+        ));
+        output.push_str(&format!(
+            "runtime.config={}\nruntime.profile={}\nruntime.unsaved_changes={}\n",
+            self.config_path.display(),
+            self.selected_profile.as_deref().unwrap_or("none"),
+            self.is_dirty()
+        ));
+        if let Some(value) = self.device_coolant {
+            output.push_str(&format!("device.coolant_c={value:.1}\n"));
+        }
+        if let Some(value) = self.device_pump_rpm {
+            output.push_str(&format!("device.pump_rpm={value}\n"));
+        }
+        let mut readings: Vec<_> = self.sensor_values.readings.iter().collect();
+        readings.sort_by_key(|(name, _)| *name);
+        output.push_str("\nsensors:\n");
+        for (name, value) in readings {
+            output.push_str(&format!("  {name}={value:.2}\n"));
+        }
+        if let Some(error) = &self.last_error {
+            output.push_str(&format!(
+                "runtime.last_error={}\n",
+                error.replace('\n', " | ")
+            ));
+        }
+        output
+    }
+
+    fn show_diagnostics(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Diagnostics");
+        let text = self.diagnostics_text();
+        egui::ScrollArea::vertical()
+            .max_height(440.0)
+            .show(ui, |ui| {
+                ui.monospace(&text);
+            });
+        ui.horizontal(|ui| {
+            if ui.button("Copy diagnostics").clicked() {
+                ui.ctx().copy_text(text);
+            }
+            if ui.button("Open config directory").clicked() {
+                if let Some(parent) = self.config_path.parent() {
+                    open_local_path(parent);
+                }
+            }
+            if ui.button("Open profile directory").clicked() {
+                open_local_path(self.profiles.dir());
+            }
+            if ui
+                .add_enabled(
+                    self.device_info.connected && !self.device_status_pending,
+                    egui::Button::new("Refresh device telemetry"),
+                )
+                .clicked()
+            {
+                self.start_device_status_refresh();
             }
         });
     }
@@ -3000,6 +3761,30 @@ impl App {
             return;
         };
         self.preview_missing_reported = false;
+
+        let sources = match desired {
+            DevicePreviewMode::BootLoop => self.boot_source_dimensions_all(),
+            DevicePreviewMode::Standby => self.standby_source_dimensions().into_iter().collect(),
+            DevicePreviewMode::Off => Vec::new(),
+        };
+        if sources.is_empty() {
+            self.stop_device_preview_child();
+            self.resume_preview_daemon();
+            return;
+        }
+        let (media, snap) = match desired {
+            DevicePreviewMode::BootLoop => (&self.boot_transform, self.boot_snap),
+            DevicePreviewMode::Standby => (&self.standby_transform, self.standby_snap),
+            DevicePreviewMode::Off => unreachable!(),
+        };
+        if let Some(error) =
+            media_placement_error_many(&sources, &media.fit, &media.transform, snap)
+        {
+            self.last_error = Some(format!("Device preview placement is invalid: {error}"));
+            self.stop_device_preview_child();
+            self.resume_preview_daemon();
+            return;
+        }
 
         let spec = self.device_preview_spec(desired, &path);
         if self
@@ -3285,6 +4070,8 @@ impl eframe::App for App {
             return;
         }
         self.poll();
+        self.handle_keyboard(ctx);
+        let before = self.working.clone();
         self.show_top_bar(ctx);
         self.show_brightness_bar(ctx);
         self.show_sidebar(ctx);
@@ -3297,6 +4084,8 @@ impl eframe::App for App {
                     Page::Overview => self.show_overview(ui),
                     Page::LiveDisplay => self.show_live_display(ui),
                     Page::StandbySettings => self.show_standby_settings(ui),
+                    Page::Profiles => self.show_profiles(ui),
+                    Page::Diagnostics => self.show_diagnostics(ui),
                     Page::Settings => self.show_settings(ui),
                 }
                 if !self.status_text.is_empty() {
@@ -3318,6 +4107,7 @@ impl eframe::App for App {
                 }
             });
         });
+        self.capture_history(before, ctx);
         self.reconcile_device_preview();
         let repaint_interval = if self.page == Page::StandbySettings
             && self.preview_mode == PreviewMode::Boot
@@ -3408,6 +4198,110 @@ fn paint_centered_grid(ui: &egui::Ui, rect: egui::Rect, grid: f32) {
     }
 }
 
+fn constrained_media_pan(
+    source: Option<(u32, u32)>,
+    fit: &ImageFit,
+    transform: &Transform2D,
+    raw: [f32; 2],
+    settings: SnapSettings,
+    apply_snap: bool,
+) -> Result<[f32; 2], String> {
+    constrained_media_pan_many(
+        &source.into_iter().collect::<Vec<_>>(),
+        fit,
+        transform,
+        raw,
+        settings,
+        apply_snap,
+    )
+}
+
+fn media_pan_region_for_sources(
+    sources: &[(u32, u32)],
+    fit: &ImageFit,
+    transform: &Transform2D,
+    keep_covered: bool,
+) -> Result<Option<(MediaFootprint, PanRegion)>, String> {
+    let mut result: Option<(MediaFootprint, PanRegion)> = None;
+    for &source in sources {
+        let Some(footprint) = MediaFootprint::new(source, fit, transform) else {
+            continue;
+        };
+        let region = footprint.pan_region(keep_covered).map_err(str::to_owned)?;
+        result = Some(match result {
+            None => (footprint, region),
+            Some((first, accumulated)) => {
+                let intersection = accumulated
+                    .intersect(&region)
+                    .ok_or_else(|| "No placement satisfies every animation frame".to_string())?;
+                (first, intersection)
+            }
+        });
+    }
+    Ok(result)
+}
+
+fn constrained_media_pan_many(
+    sources: &[(u32, u32)],
+    fit: &ImageFit,
+    transform: &Transform2D,
+    raw: [f32; 2],
+    settings: SnapSettings,
+    apply_snap: bool,
+) -> Result<[f32; 2], String> {
+    let Some((footprint, region)) =
+        media_pan_region_for_sources(sources, fit, transform, settings.keep_covered)?
+    else {
+        return Ok(raw);
+    };
+    let mut candidate = raw;
+    if apply_snap && settings.enabled {
+        let edge = if settings.edge_snap {
+            footprint.edge_snap(raw, 8.0)
+        } else {
+            [None, None]
+        };
+        for axis in 0..2 {
+            candidate[axis] =
+                edge[axis].unwrap_or_else(|| renderer::snap_value(raw[axis], settings.pan_grid));
+        }
+    }
+    Ok(region.clamp(candidate))
+}
+
+fn media_placement_error(
+    source: Option<(u32, u32)>,
+    fit: &ImageFit,
+    transform: &Transform2D,
+    settings: SnapSettings,
+) -> Option<String> {
+    media_placement_error_many(
+        &source.into_iter().collect::<Vec<_>>(),
+        fit,
+        transform,
+        settings,
+    )
+}
+
+fn media_placement_error_many(
+    sources: &[(u32, u32)],
+    fit: &ImageFit,
+    transform: &Transform2D,
+    settings: SnapSettings,
+) -> Option<String> {
+    let region = match media_pan_region_for_sources(sources, fit, transform, settings.keep_covered)
+    {
+        Ok(Some((_, region))) => region,
+        Ok(None) => return None,
+        Err(error) => return Some(error),
+    };
+    let pan = [transform.pan_x, transform.pan_y];
+    let legal = region.clamp(pan);
+    ((legal[0] - pan[0]).abs() > 0.01 || (legal[1] - pan[1]).abs() > 0.01).then(|| {
+        "Current pan would be outside the media bounds; move or center the image first".to_string()
+    })
+}
+
 fn next_unique_id<'a>(base: &str, ids: impl Iterator<Item = &'a str>) -> String {
     let existing: std::collections::HashSet<&str> = ids.collect();
     let stem: String = base
@@ -3427,6 +4321,10 @@ fn next_unique_id<'a>(base: &str, ids: impl Iterator<Item = &'a str>) -> String 
         }
     }
     unreachable!()
+}
+
+fn open_local_path(path: &Path) {
+    let _ = Command::new("xdg-open").arg(path).spawn();
 }
 
 fn override_text_row(ui: &mut egui::Ui, label: &str, resolved: &str, value: &mut Option<String>) {
@@ -3476,14 +4374,13 @@ fn override_rgb_row(
     label: &str,
     resolved: [u8; 3],
     value: &mut Option<[u8; 3]>,
+    instance_id: &str,
 ) {
     ui.horizontal(|ui| {
         ui.label(label);
-        let mut color = value
-            .unwrap_or(resolved)
-            .map(|channel| channel as f32 / 255.0);
-        if egui::color_picker::color_edit_button_rgb(ui, &mut color).changed() {
-            *value = Some(color.map(|channel| (channel * 255.0).round().clamp(0.0, 255.0) as u8));
+        let mut color = value.unwrap_or(resolved);
+        if rgb_editor(ui, (instance_id, label), &mut color) {
+            *value = Some(color);
         }
         if value.is_some() {
             if ui.small_button("Use template").clicked() {
@@ -3499,16 +4396,128 @@ fn override_rgb_row(
     });
 }
 
-fn color_map_editor(ui: &mut egui::Ui, map: &mut Vec<config::ColorPoint>) {
+fn parse_rgb_hex(text: &str) -> Option<[u8; 3]> {
+    let hex = text.strip_prefix('#')?;
+    if hex.len() != 6 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some([
+        u8::from_str_radix(&hex[0..2], 16).ok()?,
+        u8::from_str_radix(&hex[2..4], 16).ok()?,
+        u8::from_str_radix(&hex[4..6], 16).ok()?,
+    ])
+}
+
+#[derive(Clone)]
+struct ColorDraft {
+    source: [u8; 3],
+    text: String,
+    dirty: bool,
+}
+
+fn rgb_editor(ui: &mut egui::Ui, key: impl std::hash::Hash, color: &mut [u8; 3]) -> bool {
+    let id = ui.id().with(key);
+    let mut state = ui
+        .ctx()
+        .data_mut(|data| data.get_temp::<ColorDraft>(id))
+        .unwrap_or_else(|| ColorDraft {
+            source: *color,
+            text: format!("#{:02X}{:02X}{:02X}", color[0], color[1], color[2]),
+            dirty: false,
+        });
+    if !state.dirty && state.source != *color {
+        state.source = *color;
+        state.text = format!("#{:02X}{:02X}{:02X}", color[0], color[1], color[2]);
+    }
+    let mut changed = false;
+    let mut picker = color.map(|channel| channel as f32 / 255.0);
+    ui.scope(|ui| {
+        ui.spacing_mut().interact_size.y = 28.0;
+        if egui::color_picker::color_edit_button_rgb(ui, &mut picker).changed() {
+            *color = picker.map(|channel| (channel * 255.0).round().clamp(0.0, 255.0) as u8);
+            state.source = *color;
+            state.text = format!("#{:02X}{:02X}{:02X}", color[0], color[1], color[2]);
+            state.dirty = false;
+            changed = true;
+        }
+        let response = ui.add(egui::TextEdit::singleline(&mut state.text).desired_width(78.0));
+        state.dirty |= response.changed();
+        if response.lost_focus()
+            || (response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)))
+        {
+            if let Some(parsed) = parse_rgb_hex(&state.text) {
+                changed |= parsed != *color;
+                *color = parsed;
+                state.source = parsed;
+                state.text = format!("#{:02X}{:02X}{:02X}", color[0], color[1], color[2]);
+                state.dirty = false;
+            }
+        }
+        if state.dirty && parse_rgb_hex(&state.text).is_none() {
+            response.on_hover_text("Enter a color as #RRGGBB");
+            ui.label(
+                egui::RichText::new("Invalid hex")
+                    .small()
+                    .color(egui::Color32::LIGHT_RED),
+            );
+        }
+    });
+    ui.ctx().data_mut(|data| data.insert_temp(id, state));
+    changed
+}
+
+fn background_transparency_slider(ui: &mut egui::Ui, opacity: &mut u8) {
+    let mut transparency = 100 - (u16::from(*opacity) * 100 / 255) as u8;
+    if ui
+        .add(egui::Slider::new(&mut transparency, 0..=100).text("Transparency"))
+        .changed()
+    {
+        *opacity = (((100 - transparency) as u16 * 255 + 50) / 100) as u8;
+    }
+}
+
+fn override_background_transparency_row(
+    ui: &mut egui::Ui,
+    inherited_opacity: u8,
+    override_opacity: &mut Option<u8>,
+) {
+    ui.horizontal(|ui| {
+        if let Some(opacity) = override_opacity {
+            background_transparency_slider(ui, opacity);
+            if ui.small_button("Use template").clicked() {
+                *override_opacity = None;
+            }
+        } else {
+            let transparency = 100 - (u16::from(inherited_opacity) * 100 / 255) as u8;
+            ui.label(format!("Transparency: {transparency}% (template)"));
+            if ui.small_button("Override").clicked() {
+                *override_opacity = Some(inherited_opacity);
+            }
+        }
+    });
+}
+
+fn color_map_editor(ui: &mut egui::Ui, map: &mut Vec<config::ColorPoint>, owner_id: &str) {
+    let ids_key = ui.id().with((owner_id, "threshold-row-ids"));
+    let mut row_ids = ui
+        .ctx()
+        .data_mut(|data| data.get_temp::<Vec<u64>>(ids_key))
+        .unwrap_or_default();
+    row_ids.truncate(map.len());
+    let mut next_id = row_ids.iter().copied().max().unwrap_or(0) + 1;
+    while row_ids.len() < map.len() {
+        row_ids.push(next_id);
+        next_id += 1;
+    }
     let mut remove = None;
     for (index, point) in map.iter_mut().enumerate() {
         ui.horizontal(|ui| {
             ui.add(egui::DragValue::new(&mut point.value).speed(0.5));
-            let mut color = point.color.map(|channel| channel as f32 / 255.0);
-            if egui::color_picker::color_edit_button_rgb(ui, &mut color).changed() {
-                point.color =
-                    color.map(|channel| (channel * 255.0).round().clamp(0.0, 255.0) as u8);
-            }
+            rgb_editor(
+                ui,
+                (owner_id, "threshold", row_ids[index]),
+                &mut point.color,
+            );
             if ui.small_button("Remove").clicked() {
                 remove = Some(index);
             }
@@ -3516,19 +4525,94 @@ fn color_map_editor(ui: &mut egui::Ui, map: &mut Vec<config::ColorPoint>) {
     }
     if let Some(index) = remove {
         map.remove(index);
+        row_ids.remove(index);
     }
     if ui.small_button("Add threshold").clicked() {
         map.push(config::ColorPoint {
             value: map.last().map_or(0.0, |point| point.value + 10.0),
             color: [255, 255, 255],
         });
+        row_ids.push(next_id);
     }
-    map.sort_by(|left, right| left.value.total_cmp(&right.value));
+    let mut rows: Vec<_> = std::mem::take(map).into_iter().zip(row_ids).collect();
+    rows.sort_by(|left, right| left.0.value.total_cmp(&right.0.value));
+    let (points, row_ids): (Vec<_>, Vec<_>) = rows.into_iter().unzip();
+    *map = points;
+    ui.ctx().data_mut(|data| data.insert_temp(ids_key, row_ids));
 }
 
 #[cfg(test)]
 mod transform_drag_tests {
     use super::*;
+
+    #[test]
+    fn rgb_hex_requires_complete_hash_prefixed_color() {
+        assert_eq!(parse_rgb_hex("#aBcD09"), Some([0xab, 0xcd, 0x09]));
+        for invalid in ["abcd09", "#abcd", "#abcd0x", "#abcd0900"] {
+            assert_eq!(parse_rgb_hex(invalid), None);
+        }
+    }
+
+    #[test]
+    fn media_edge_snapping_precedes_grid_and_clamps() {
+        let transform = Transform2D::default();
+        let snap = SnapSettings {
+            pan_grid: 10.0,
+            ..SnapSettings::default()
+        };
+        assert_eq!(
+            constrained_media_pan(
+                Some((480, 480)),
+                &ImageFit::Native,
+                &transform,
+                [474.0, 0.0],
+                snap,
+                true
+            )
+            .unwrap(),
+            [480.0, 0.0]
+        );
+        assert_eq!(
+            constrained_media_pan(
+                Some((480, 480)),
+                &ImageFit::Native,
+                &transform,
+                [600.0, 0.0],
+                snap,
+                true
+            )
+            .unwrap(),
+            [480.0, 0.0]
+        );
+        let strict = SnapSettings {
+            keep_covered: true,
+            ..snap
+        };
+        assert_eq!(
+            constrained_media_pan(
+                Some((480, 480)),
+                &ImageFit::Native,
+                &transform,
+                [10.0, 0.0],
+                strict,
+                false
+            )
+            .unwrap(),
+            [0.0, 0.0]
+        );
+        assert_eq!(
+            constrained_media_pan_many(
+                &[(480, 480), (300, 300)],
+                &ImageFit::Native,
+                &transform,
+                [500.0, 0.0],
+                snap,
+                false,
+            )
+            .unwrap(),
+            [390.0, 0.0]
+        );
+    }
 
     #[test]
     fn parses_daemon_and_direct_device_telemetry() {
@@ -3803,7 +4887,13 @@ mod device_preview_mode_tests {
             desired_device_preview_mode_for(true, Page::StandbySettings, StandbyTab::Standby),
             DevicePreviewMode::Standby
         );
-        for page in [Page::Overview, Page::LiveDisplay, Page::Settings] {
+        for page in [
+            Page::Overview,
+            Page::LiveDisplay,
+            Page::Profiles,
+            Page::Diagnostics,
+            Page::Settings,
+        ] {
             assert_eq!(
                 desired_device_preview_mode_for(true, page, StandbyTab::Boot),
                 DevicePreviewMode::Off

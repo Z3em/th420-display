@@ -88,6 +88,7 @@ impl ProfileStore {
         let text = fs::read_to_string(path)?;
         let mut config: Config = toml::from_str(&text)?;
         config.migrate_sensors();
+        config.migrate_widgets();
         Ok(config)
     }
 
@@ -133,6 +134,7 @@ impl ProfileStore {
         let text = fs::read_to_string(source)?;
         let mut config: Config = toml::from_str(&text)?;
         config.migrate_sensors();
+        config.migrate_widgets();
         let stem = source
             .file_stem()
             .and_then(|s| s.to_str())

@@ -34,6 +34,9 @@ pub struct DragSnapState {
 }
 
 impl DragSnapState {
+    pub fn moved(&self) -> bool {
+        self.moved
+    }
     pub fn new(origin: [f32; 2]) -> Self {
         Self {
             origin,
@@ -73,6 +76,283 @@ pub fn snap_value(value: f32, grid: f32) -> f32 {
     } else {
         (value / grid).round() * grid
     }
+}
+
+/// The actual transformed source footprint, before rotation padding is filled
+/// with canvas color. Coordinates are relative to the canvas center.
+#[derive(Clone, Debug)]
+pub struct MediaFootprint {
+    pub corners: [[f32; 2]; 4],
+}
+
+impl MediaFootprint {
+    pub fn new(source: (u32, u32), fit: &ImageFit, transform: &Transform2D) -> Option<Self> {
+        let (sw, sh) = source;
+        if sw == 0 || sh == 0 {
+            return None;
+        }
+        let zoom = transform.zoom.clamp(0.05, 8.0);
+        let stretch_x = transform.stretch_x.clamp(0.05, 8.0);
+        let stretch_y = transform.stretch_y.clamp(0.05, 8.0);
+        let (base_w, base_h) = match fit {
+            ImageFit::Cover => {
+                let scale = (480.0 / sw as f32).max(480.0 / sh as f32) * zoom;
+                (sw as f32 * scale, sh as f32 * scale)
+            }
+            ImageFit::Contain => {
+                let scale = (480.0 / sw as f32).min(480.0 / sh as f32) * zoom;
+                (sw as f32 * scale, sh as f32 * scale)
+            }
+            ImageFit::Stretch => (480.0 * zoom, 480.0 * zoom),
+            ImageFit::Native => (sw as f32 * zoom, sh as f32 * zoom),
+        };
+        let half_w = (base_w * stretch_x).round().clamp(1.0, 8192.0) / 2.0;
+        let half_h = (base_h * stretch_y).round().clamp(1.0, 8192.0) / 2.0;
+        let (sin, cos) = transform.rotation.to_radians().sin_cos();
+        Some(Self {
+            corners: [
+                [-half_w, -half_h],
+                [half_w, -half_h],
+                [half_w, half_h],
+                [-half_w, half_h],
+            ]
+            .map(|[x, y]| [x * cos - y * sin, x * sin + y * cos]),
+        })
+    }
+
+    pub fn pan_region(&self, keep_covered: bool) -> Result<PanRegion, &'static str> {
+        const CANVAS: [[f32; 2]; 4] = [
+            [-240.0, -240.0],
+            [240.0, -240.0],
+            [240.0, 240.0],
+            [-240.0, 240.0],
+        ];
+        if !keep_covered {
+            let mut sums = Vec::with_capacity(16);
+            for canvas in CANVAS {
+                for media in self.corners {
+                    sums.push([canvas[0] - media[0], canvas[1] - media[1]]);
+                }
+            }
+            return Ok(PanRegion {
+                vertices: convex_hull(sums),
+            });
+        }
+        let edge = [
+            self.corners[1][0] - self.corners[0][0],
+            self.corners[1][1] - self.corners[0][1],
+        ];
+        let length = edge[0].hypot(edge[1]);
+        let u = [edge[0] / length, edge[1] / length];
+        let v = [-u[1], u[0]];
+        let half_w = length / 2.0;
+        let half_h = (self.corners[2][0] - self.corners[1][0])
+            .hypot(self.corners[2][1] - self.corners[1][1])
+            / 2.0;
+        let mut polygon = vec![
+            [-20000.0, -20000.0],
+            [20000.0, -20000.0],
+            [20000.0, 20000.0],
+            [-20000.0, 20000.0],
+        ];
+        for (axis, half) in [(u, half_w), (v, half_h)] {
+            let projections = CANVAS.map(|corner| dot(corner, axis));
+            let min = projections.into_iter().fold(f32::INFINITY, f32::min);
+            let max = projections.into_iter().fold(f32::NEG_INFINITY, f32::max);
+            if max - min > 2.0 * half + 0.001 {
+                return Err("This size and rotation cannot cover the canvas; increase zoom or stretch first");
+            }
+            polygon = clip_half_plane(&polygon, axis, min + half);
+            polygon = clip_half_plane(&polygon, [-axis[0], -axis[1]], half - max);
+        }
+        if polygon.is_empty() {
+            return Err(
+                "This size and rotation cannot cover the canvas; increase zoom or stretch first",
+            );
+        }
+        Ok(PanRegion {
+            vertices: convex_hull(polygon),
+        })
+    }
+
+    pub fn edge_snap(&self, pan: [f32; 2], distance: f32) -> [Option<f32>; 2] {
+        let mut result = [None, None];
+        for axis in 0..2 {
+            let min = self
+                .corners
+                .iter()
+                .map(|corner| corner[axis])
+                .fold(f32::INFINITY, f32::min);
+            let max = self
+                .corners
+                .iter()
+                .map(|corner| corner[axis])
+                .fold(f32::NEG_INFINITY, f32::max);
+            let targets = [-240.0 - min, 240.0 - min, -240.0 - max, 240.0 - max];
+            result[axis] = targets
+                .into_iter()
+                .filter(|target| (target - pan[axis]).abs() <= distance)
+                .min_by(|a, b| (a - pan[axis]).abs().total_cmp(&(b - pan[axis]).abs()));
+        }
+        result
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct PanRegion {
+    pub vertices: Vec<[f32; 2]>,
+}
+
+impl PanRegion {
+    pub fn intersect(&self, other: &Self) -> Option<Self> {
+        if self.vertices.is_empty() || other.vertices.is_empty() {
+            return None;
+        }
+        if self.vertices.len() == 1 {
+            let point = self.vertices[0];
+            return (distance_sq(other.clamp(point), point) < 0.0001).then(|| self.clone());
+        }
+        if other.vertices.len() == 1 {
+            return other.intersect(self);
+        }
+        let (base, clip) = if self.vertices.len() <= 2 && other.vertices.len() > 2 {
+            (self, other)
+        } else if other.vertices.len() <= 2 && self.vertices.len() > 2 {
+            (other, self)
+        } else {
+            (self, other)
+        };
+        if clip.vertices.len() <= 2 {
+            let intersections: Vec<_> = base
+                .vertices
+                .iter()
+                .copied()
+                .filter(|point| distance_sq(clip.clamp(*point), *point) < 0.0001)
+                .collect();
+            return (!intersections.is_empty()).then(|| Self {
+                vertices: convex_hull(intersections),
+            });
+        }
+        let mut polygon = base.vertices.clone();
+        for (index, start) in clip.vertices.iter().enumerate() {
+            let end = clip.vertices[(index + 1) % clip.vertices.len()];
+            let edge = [end[0] - start[0], end[1] - start[1]];
+            let normal = [edge[1], -edge[0]];
+            polygon = clip_half_plane(&polygon, normal, dot(normal, *start));
+            if polygon.is_empty() {
+                return None;
+            }
+        }
+        Some(Self {
+            vertices: convex_hull(polygon),
+        })
+    }
+
+    pub fn clamp(&self, point: [f32; 2]) -> [f32; 2] {
+        if self.vertices.is_empty() || !point.iter().all(|value| value.is_finite()) {
+            return point;
+        }
+        if self.vertices.len() == 1 {
+            return self.vertices[0];
+        }
+        let area: f32 = self
+            .vertices
+            .iter()
+            .enumerate()
+            .map(|(index, start)| {
+                let end = self.vertices[(index + 1) % self.vertices.len()];
+                start[0] * end[1] - start[1] * end[0]
+            })
+            .sum();
+        if area.abs() > 0.001
+            && self.vertices.iter().enumerate().all(|(index, start)| {
+                let end = self.vertices[(index + 1) % self.vertices.len()];
+                cross(*start, end, point) >= -0.001
+            })
+        {
+            return point;
+        }
+        self.vertices
+            .iter()
+            .enumerate()
+            .map(|(index, start)| {
+                let end = self.vertices[(index + 1) % self.vertices.len()];
+                let delta = [end[0] - start[0], end[1] - start[1]];
+                let length_sq = dot(delta, delta);
+                let t = if length_sq <= f32::EPSILON {
+                    0.0
+                } else {
+                    (dot([point[0] - start[0], point[1] - start[1]], delta) / length_sq)
+                        .clamp(0.0, 1.0)
+                };
+                [start[0] + t * delta[0], start[1] + t * delta[1]]
+            })
+            .min_by(|a, b| distance_sq(*a, point).total_cmp(&distance_sq(*b, point)))
+            .unwrap_or(point)
+    }
+}
+
+fn dot(a: [f32; 2], b: [f32; 2]) -> f32 {
+    a[0] * b[0] + a[1] * b[1]
+}
+fn cross(a: [f32; 2], b: [f32; 2], c: [f32; 2]) -> f32 {
+    (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+}
+fn distance_sq(a: [f32; 2], b: [f32; 2]) -> f32 {
+    (a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2)
+}
+
+fn convex_hull(mut points: Vec<[f32; 2]>) -> Vec<[f32; 2]> {
+    points.sort_by(|a, b| a[0].total_cmp(&b[0]).then(a[1].total_cmp(&b[1])));
+    points.dedup();
+    if points.len() <= 2 {
+        return points;
+    }
+    let mut lower = Vec::new();
+    for point in &points {
+        while lower.len() >= 2
+            && cross(lower[lower.len() - 2], lower[lower.len() - 1], *point) <= 0.0
+        {
+            lower.pop();
+        }
+        lower.push(*point);
+    }
+    let mut upper = Vec::new();
+    for point in points.iter().rev() {
+        while upper.len() >= 2
+            && cross(upper[upper.len() - 2], upper[upper.len() - 1], *point) <= 0.0
+        {
+            upper.pop();
+        }
+        upper.push(*point);
+    }
+    lower.pop();
+    upper.pop();
+    lower.extend(upper);
+    lower
+}
+
+fn clip_half_plane(polygon: &[[f32; 2]], normal: [f32; 2], limit: f32) -> Vec<[f32; 2]> {
+    if polygon.is_empty() {
+        return Vec::new();
+    }
+    let mut output = Vec::new();
+    for (index, current) in polygon.iter().enumerate() {
+        let next = polygon[(index + 1) % polygon.len()];
+        let current_d = dot(*current, normal) - limit;
+        let next_d = dot(next, normal) - limit;
+        if current_d <= 0.0 {
+            output.push(*current);
+        }
+        if (current_d < 0.0 && next_d > 0.0) || (current_d > 0.0 && next_d < 0.0) {
+            let t = current_d / (current_d - next_d);
+            output.push([
+                current[0] + t * (next[0] - current[0]),
+                current[1] + t * (next[1] - current[1]),
+            ]);
+        }
+    }
+    output
 }
 
 pub fn centered_grid_coordinates(grid: f32) -> Vec<f32> {
@@ -184,6 +464,7 @@ enum AnimatedSource {
 
 pub struct TimedAnimation {
     frames: Vec<(RgbImage, Duration)>,
+    dimensions: Vec<(u32, u32)>,
     started: Instant,
 }
 
@@ -213,8 +494,16 @@ impl TimedAnimation {
         if frames.is_empty() {
             return Err("boot animation contains no frames".into());
         }
+        let mut dimensions = Vec::new();
+        for (frame, _) in &frames {
+            let size = (frame.width(), frame.height());
+            if !dimensions.contains(&size) {
+                dimensions.push(size);
+            }
+        }
         Ok(Self {
             frames,
+            dimensions,
             started: Instant::now(),
         })
     }
@@ -225,6 +514,10 @@ impl TimedAnimation {
 
     pub fn frame(&self, index: usize) -> Option<&RgbImage> {
         self.frames.get(index).map(|(frame, _)| frame)
+    }
+
+    pub fn frame_dimensions(&self) -> Vec<(u32, u32)> {
+        self.dimensions.clone()
     }
 
     pub fn frame_start_seconds(&self, index: usize) -> f64 {
@@ -504,6 +797,13 @@ impl Renderer {
             .and_then(|(_, source)| source.frame_interval())
     }
 
+    pub fn background_source_dimensions(&self, path: &str) -> Option<(u32, u32)> {
+        self.bg_source_cache
+            .as_ref()
+            .filter(|(cached_path, _)| cached_path == path)
+            .map(|(_, image)| (image.width(), image.height()))
+    }
+
     fn update_bg_cache(&mut self, config: &Config) {
         if !config.background.enabled {
             self.bg_source = None;
@@ -587,26 +887,95 @@ impl Renderer {
         &self,
         config: &Config,
         instance_id: &str,
-        values: &SensorValues,
+        _values: &SensorValues,
     ) -> Option<[f32; 2]> {
         let instance = config
             .widget_instances
             .iter()
             .find(|instance| instance.id == instance_id)?;
         let widget = config.resolved_widget(instance)?;
-        let font = FontRef::try_from_slice(&self.font_bytes).ok()?;
-        let raw = values.readings.get(&widget.source_id).copied();
-        let value = raw
-            .map(|value| format_value(&widget.unit, value))
-            .unwrap_or_else(|| "--".to_string());
-        let [width, height] = widget_layer_dimensions(&font, &widget, &value);
-        let width = width * widget.transform.zoom * widget.transform.stretch_x;
-        let height = height * widget.transform.zoom * widget.transform.stretch_y;
+        let width = widget.style.width;
+        let height = widget.style.height;
         let radians = widget.transform.rotation.to_radians();
         Some([
             width * radians.cos().abs() + height * radians.sin().abs(),
             width * radians.sin().abs() + height * radians.cos().abs(),
         ])
+    }
+
+    pub fn widget_corners(&self, config: &Config, instance_id: &str) -> Option<[[f32; 2]; 4]> {
+        let instance = config
+            .widget_instances
+            .iter()
+            .find(|item| item.id == instance_id)?;
+        let widget = config.resolved_widget(instance)?;
+        if !widget.style.width.is_finite()
+            || !widget.style.height.is_finite()
+            || widget.style.width <= 0.0
+            || widget.style.height <= 0.0
+        {
+            return None;
+        }
+        let half_width = widget.style.width / 2.0;
+        let half_height = widget.style.height / 2.0;
+        let (sin, cos) = widget.transform.rotation.to_radians().sin_cos();
+        Some(
+            [
+                [-half_width, -half_height],
+                [half_width, -half_height],
+                [half_width, half_height],
+                [-half_width, half_height],
+            ]
+            .map(|[x, y]| {
+                [
+                    widget.transform.pan_x + x * cos - y * sin,
+                    widget.transform.pan_y + x * sin + y * cos,
+                ]
+            }),
+        )
+    }
+
+    pub fn widget_contains(
+        &self,
+        config: &Config,
+        instance_id: &str,
+        point: [f32; 2],
+        tolerance: f32,
+    ) -> bool {
+        let Some(instance) = config
+            .widget_instances
+            .iter()
+            .find(|item| item.id == instance_id)
+        else {
+            return false;
+        };
+        let Some(widget) = config.resolved_widget(instance) else {
+            return false;
+        };
+        if !widget.style.width.is_finite()
+            || !widget.style.height.is_finite()
+            || widget.style.width <= 0.0
+            || widget.style.height <= 0.0
+        {
+            return false;
+        }
+        let dx = point[0] - widget.transform.pan_x;
+        let dy = point[1] - widget.transform.pan_y;
+        let (sin, cos) = widget.transform.rotation.to_radians().sin_cos();
+        let local_x = dx * cos + dy * sin;
+        let local_y = -dx * sin + dy * cos;
+        let tolerance = tolerance.max(0.0);
+        local_x.abs() <= widget.style.width / 2.0 + tolerance
+            && local_y.abs() <= widget.style.height / 2.0 + tolerance
+    }
+
+    pub fn widget_content_size(
+        &self,
+        widget: &crate::config::ResolvedWidget,
+        value: &str,
+    ) -> Option<[f32; 2]> {
+        let font = FontRef::try_from_slice(&self.font_bytes).ok()?;
+        Some(widget_layer_dimensions(&font, widget, value))
     }
 
     fn render_base(&self, config: &Config, v: &SensorValues) -> RgbImage {
@@ -713,27 +1082,40 @@ fn draw_widget_instance(
     let value_color = raw
         .map(|value| crate::config::interpolate_color(value, &widget.style.color_map))
         .unwrap_or([150, 150, 150]);
-    let [logical_width, logical_height] = widget_layer_dimensions(font, widget, &value);
+    let logical_width = widget.style.width;
+    let logical_height = widget.style.height;
+    if !logical_width.is_finite()
+        || !logical_height.is_finite()
+        || logical_width <= 0.0
+        || logical_height <= 0.0
+    {
+        return;
+    }
     let label_offset_y = effective_label_offset_y(&widget.style);
     let min_y = label_offset_y.min(0.0);
-    let width = logical_width.ceil().max(1.0) as u32;
-    let height = logical_height.ceil().max(1.0) as u32;
-    let mut layer = RgbaImage::new(width, height);
+    let max_y = widget
+        .style
+        .value_font_size
+        .max(label_offset_y + widget.style.label_font_size);
+    let group_top = ((logical_height - (max_y - min_y)) / 2.0).round();
+    let width = logical_width.ceil().clamp(1.0, 4096.0) as u32;
+    let height = logical_height.ceil().clamp(1.0, 4096.0) as u32;
+    let mut text_layer = RgbaImage::new(width, height);
     draw_centered_rgba(
-        &mut layer,
+        &mut text_layer,
         font,
         &value,
         width as i32 / 2,
-        (4.0 - min_y).round() as i32,
+        (group_top - min_y).round() as i32,
         widget.style.value_font_size,
         Rgba([value_color[0], value_color[1], value_color[2], 255]),
     );
     draw_centered_rgba(
-        &mut layer,
+        &mut text_layer,
         font,
         &widget.label,
         (width as f32 / 2.0 + widget.style.label_offset_x).round() as i32,
-        (4.0 + label_offset_y - min_y).round() as i32,
+        (group_top + label_offset_y - min_y).round() as i32,
         widget.style.label_font_size,
         Rgba([
             widget.style.label_color[0],
@@ -742,21 +1124,21 @@ fn draw_widget_instance(
             255,
         ]),
     );
+    let layer = if widget.style.background_opacity > 0 {
+        let [red, green, blue] = widget.style.background_color;
+        let mut background = RgbaImage::from_pixel(
+            width,
+            height,
+            Rgba([red, green, blue, widget.style.background_opacity]),
+        );
+        imageops::overlay(&mut background, &text_layer, 0, 0);
+        background
+    } else {
+        text_layer
+    };
 
     let transform = widget.transform;
-    let scaled_width = (layer.width() as f32 * transform.zoom * transform.stretch_x)
-        .round()
-        .clamp(1.0, 4096.0) as u32;
-    let scaled_height = (layer.height() as f32 * transform.zoom * transform.stretch_y)
-        .round()
-        .clamp(1.0, 4096.0) as u32;
-    let scaled = imageops::resize(
-        &layer,
-        scaled_width,
-        scaled_height,
-        imageops::FilterType::Lanczos3,
-    );
-    let transformed = rotate_rgba_expanded(&scaled, transform.rotation);
+    let transformed = rotate_rgba_expanded(&layer, transform.rotation);
     let left = (240.0 + transform.pan_x - transformed.width() as f32 / 2.0).round() as i64;
     let top = (240.0 + transform.pan_y - transformed.height() as f32 / 2.0).round() as i64;
     overlay_rgba(canvas, &transformed, left, top);
@@ -1230,6 +1612,94 @@ mod tests {
     fn render_triple_digit_temps_no_panic() {
         let img = Renderer::new().render_preview(&Config::default(), &triple_digit());
         assert_eq!((img.width(), img.height()), (480, 480));
+    }
+
+    #[test]
+    fn widget_background_uses_fixed_box() {
+        let config = Config::default();
+        let mut widget = config.resolved_widget(&config.widget_instances[0]).unwrap();
+        widget.style.background_color = [200, 0, 0];
+        widget.style.background_opacity = 128;
+        widget.label.clear();
+        widget.transform.pan_x = 0.0;
+        widget.transform.pan_y = 0.0;
+        let font = FontRef::try_from_slice(FONT_BYTES).unwrap();
+        let [width, height] = [widget.style.width, widget.style.height];
+        let corner_x = (240.0 - width.ceil() / 2.0).round() as u32 + 1;
+        let corner_y = (240.0 - height.ceil() / 2.0).round() as u32 + 1;
+        let mut canvas = RgbImage::from_pixel(480, 480, Rgb([0, 0, 0]));
+        draw_widget_instance(&mut canvas, &font, &widget, Some(25.0));
+        let first = canvas.get_pixel(corner_x, corner_y);
+        assert_eq!(*first, Rgb([100, 0, 0]));
+
+        widget.style.width *= 2.0;
+        widget.style.height *= 2.0;
+        let mut enlarged = RgbImage::from_pixel(480, 480, Rgb([0, 0, 0]));
+        draw_widget_instance(&mut enlarged, &font, &widget, Some(25.0));
+        let count_red = |image: &RgbImage| image.pixels().filter(|pixel| pixel[0] > 0).count();
+        assert!(count_red(&enlarged) > count_red(&canvas) * 2);
+    }
+
+    #[test]
+    fn widget_geometry_does_not_change_with_telemetry() {
+        let mut config = Config::default();
+        let id = config.widget_instances[0].id.clone();
+        let renderer = Renderer::new();
+        let mut values = SensorValues {
+            readings: HashMap::new(),
+        };
+        values
+            .readings
+            .insert(config.widget_instances[0].source_id.clone(), 99.0);
+        let before = renderer.widget_bounds(&config, &id, &values).unwrap();
+        values
+            .readings
+            .insert(config.widget_instances[0].source_id.clone(), 100.0);
+        assert_eq!(
+            renderer.widget_bounds(&config, &id, &values).unwrap(),
+            before
+        );
+        config.widget_instances[0].transform.rotation = 45.0;
+        let corners = renderer.widget_corners(&config, &id).unwrap();
+        let edge = [corners[1][0] - corners[0][0], corners[1][1] - corners[0][1]];
+        assert!(
+            (edge[0].hypot(edge[1]) - config.widget_instances[0].overrides.width.unwrap()).abs()
+                < 0.01
+        );
+    }
+
+    #[test]
+    fn widget_hit_test_excludes_rotated_bounding_box_corners() {
+        let mut config = Config::default();
+        let id = config.widget_instances[0].id.clone();
+        config.widget_instances[0].transform.pan_x = 0.0;
+        config.widget_instances[0].transform.pan_y = 0.0;
+        config.widget_instances[0].transform.rotation = 45.0;
+        let renderer = Renderer::new();
+        assert!(renderer.widget_contains(&config, &id, [0.0, 0.0], 0.0));
+        assert!(!renderer.widget_contains(&config, &id, [95.0, 95.0], 0.0));
+    }
+
+    #[test]
+    fn media_pan_regions_use_actual_source_edges() {
+        let transform = Transform2D::default();
+        let footprint = MediaFootprint::new((480, 480), &ImageFit::Native, &transform).unwrap();
+        let relaxed = footprint.pan_region(false).unwrap();
+        assert_eq!(relaxed.clamp([960.0, 0.0]), [480.0, 0.0]);
+        assert_eq!(relaxed.clamp([479.0, 0.0]), [479.0, 0.0]);
+        let strict = footprint.pan_region(true).unwrap();
+        assert_eq!(strict.clamp([10.0, 0.0]), [0.0, 0.0]);
+        assert_eq!(footprint.edge_snap([474.0, 0.0], 8.0)[0], Some(480.0));
+        let rotated = MediaFootprint::new(
+            (480, 480),
+            &ImageFit::Native,
+            &Transform2D {
+                rotation: 45.0,
+                ..transform
+            },
+        )
+        .unwrap();
+        assert!(rotated.pan_region(true).is_err());
     }
 
     #[test]

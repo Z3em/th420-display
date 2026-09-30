@@ -1075,12 +1075,10 @@ mod tests {
     #[test]
     fn daemon_telemetry_preserves_last_valid_sample_after_error() {
         let control = DaemonControl::new_starting();
-        assert!(
-            control
-                .command("telemetry", Duration::ZERO)
-                .unwrap_err()
-                .contains("not available")
-        );
+        assert!(control
+            .command("telemetry", Duration::ZERO)
+            .unwrap_err()
+            .contains("not available"));
 
         control.update_telemetry(28.5, 2320);
         let sample = control.command("telemetry", Duration::ZERO).unwrap();

@@ -264,8 +264,26 @@ pub struct LayoutConfig {
 pub const WIDGET_MODEL_VERSION: u32 = 1;
 pub const BUILTIN_SENSOR_TEMPLATE_ID: &str = "builtin.sensor-value-label";
 
+fn default_widget_width() -> f32 {
+    180.0
+}
+fn default_widget_height() -> f32 {
+    100.0
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq)]
+pub struct WidgetPlacement {
+    pub pan_x: f32,
+    pub pan_y: f32,
+    pub rotation: f32,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct WidgetStyle {
+    #[serde(default = "default_widget_width")]
+    pub width: f32,
+    #[serde(default = "default_widget_height")]
+    pub height: f32,
     pub value_font_size: f32,
     pub label_font_size: f32,
     pub label_offset_y: f32,
@@ -273,6 +291,10 @@ pub struct WidgetStyle {
     pub label_offset_x: f32,
     pub label_color: [u8; 3],
     pub color_map: Vec<ColorPoint>,
+    #[serde(default)]
+    pub background_color: [u8; 3],
+    #[serde(default)]
+    pub background_opacity: u8,
     #[serde(default)]
     pub show_missing: bool,
 }
@@ -297,6 +319,8 @@ pub struct WidgetTemplate {
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct WidgetOverrides {
+    pub width: Option<f32>,
+    pub height: Option<f32>,
     pub label: Option<String>,
     pub unit: Option<String>,
     pub value_font_size: Option<f32>,
@@ -305,6 +329,8 @@ pub struct WidgetOverrides {
     pub label_offset_x: Option<f32>,
     pub label_color: Option<[u8; 3]>,
     pub color_map: Option<Vec<ColorPoint>>,
+    pub background_color: Option<[u8; 3]>,
+    pub background_opacity: Option<u8>,
     pub show_missing: Option<bool>,
 }
 
@@ -317,7 +343,7 @@ pub struct WidgetInstance {
     #[serde(default = "default_true")]
     pub visible: bool,
     #[serde(default)]
-    pub transform: Transform2D,
+    pub transform: WidgetPlacement,
     #[serde(default)]
     pub overrides: WidgetOverrides,
 }
@@ -328,7 +354,7 @@ pub struct ResolvedWidget {
     pub name: String,
     pub source_id: String,
     pub visible: bool,
-    pub transform: Transform2D,
+    pub transform: WidgetPlacement,
     pub label: String,
     pub unit: String,
     pub style: WidgetStyle,
@@ -341,12 +367,16 @@ pub fn builtin_sensor_template() -> WidgetTemplate {
         built_in: true,
         kind: WidgetKind::ValueLabel,
         style: WidgetStyle {
+            width: default_widget_width(),
+            height: default_widget_height(),
             value_font_size: 52.0,
             label_font_size: 24.0,
             label_offset_y: 38.0,
             label_offset_x: 0.0,
             label_color: [150, 150, 185],
             color_map: pct_map(),
+            background_color: [0, 0, 0],
+            background_opacity: 0,
             show_missing: false,
         },
     }
@@ -821,6 +851,12 @@ impl Config {
         if let Some(value) = overrides.value_font_size {
             style.value_font_size = value;
         }
+        if let Some(value) = overrides.width {
+            style.width = value;
+        }
+        if let Some(value) = overrides.height {
+            style.height = value;
+        }
         if let Some(value) = overrides.label_font_size {
             style.label_font_size = value;
         }
@@ -835,6 +871,12 @@ impl Config {
         }
         if let Some(value) = &overrides.color_map {
             style.color_map = value.clone();
+        }
+        if let Some(value) = overrides.background_color {
+            style.background_color = value;
+        }
+        if let Some(value) = overrides.background_opacity {
+            style.background_opacity = value;
         }
         if let Some(value) = overrides.show_missing {
             style.show_missing = value;
@@ -882,12 +924,16 @@ impl Config {
             let label_offset_y = (slot.label_y - slot.value_y) as f32;
             let label_offset_x = (slot.label_cx - slot.value_cx) as f32;
             let style = WidgetStyle {
+                width: 180.0,
+                height: 100.0,
                 value_font_size: slot.value_fs,
                 label_font_size: slot.label_fs,
                 label_offset_y,
                 label_offset_x,
                 label_color: source.label_color,
                 color_map: source.color_map.clone(),
+                background_color: [0, 0, 0],
+                background_opacity: 0,
                 show_missing: false,
             };
             let height = widget_local_height(&style);
@@ -901,12 +947,14 @@ impl Config {
                 template_id: BUILTIN_SENSOR_TEMPLATE_ID.to_string(),
                 source_id,
                 visible: true,
-                transform: Transform2D {
+                transform: WidgetPlacement {
                     pan_x: slot.value_cx as f32 - 240.0,
                     pan_y: slot.value_y as f32 + min_y + height / 2.0 - 240.0,
-                    ..Transform2D::default()
+                    ..WidgetPlacement::default()
                 },
                 overrides: WidgetOverrides {
+                    width: Some(style.width),
+                    height: Some(style.height),
                     label: Some(source_label),
                     unit: Some(source_unit),
                     value_font_size: Some(slot.value_fs),
@@ -915,6 +963,8 @@ impl Config {
                     label_offset_x: Some(label_offset_x),
                     label_color: Some(style.label_color),
                     color_map: Some(style.color_map),
+                    background_color: None,
+                    background_opacity: None,
                     show_missing: None,
                 },
             });
@@ -933,7 +983,7 @@ impl Config {
                 template_id: BUILTIN_SENSOR_TEMPLATE_ID.to_string(),
                 source_id: source.id.clone(),
                 visible: false,
-                transform: Transform2D::default(),
+                transform: WidgetPlacement::default(),
                 overrides: WidgetOverrides {
                     label: Some(source.label.clone()),
                     unit: Some(source.unit.clone()),
@@ -1311,6 +1361,82 @@ mod tests {
                 .value_font_size,
             33.0
         );
+    }
+
+    #[test]
+    fn widget_box_size_is_inherited_or_overridden_independently() {
+        let mut config = Config::default();
+        config.widget_instances[0].overrides.width = None;
+        config.widget_instances[0].overrides.height = None;
+        let mut sibling = config.widget_instances[0].clone();
+        sibling.id = "sibling".to_string();
+        sibling.overrides.width = Some(220.0);
+        config.widget_instances.push(sibling);
+        let sibling_index = config.widget_instances.len() - 1;
+        config.widget_templates[0].style.width = 190.0;
+        config.widget_templates[0].style.height = 110.0;
+        assert_eq!(
+            config
+                .resolved_widget(&config.widget_instances[0])
+                .unwrap()
+                .style
+                .width,
+            190.0
+        );
+        assert_eq!(
+            config
+                .resolved_widget(&config.widget_instances[sibling_index])
+                .unwrap()
+                .style
+                .width,
+            220.0
+        );
+        assert_eq!(
+            config
+                .resolved_widget(&config.widget_instances[sibling_index])
+                .unwrap()
+                .style
+                .height,
+            110.0
+        );
+        let loaded: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(
+            loaded.widget_instances[sibling_index].overrides.width,
+            Some(220.0)
+        );
+        assert_eq!(
+            loaded.widget_instances[sibling_index].transform.rotation,
+            0.0
+        );
+    }
+
+    #[test]
+    fn widget_background_inherits_and_can_be_overridden() {
+        let mut config = Config::default();
+        config.widget_templates[0].style.background_color = [12, 34, 56];
+        config.widget_templates[0].style.background_opacity = 180;
+        let instance = &config.widget_instances[0];
+        let resolved = config.resolved_widget(instance).unwrap();
+        assert_eq!(resolved.style.background_color, [12, 34, 56]);
+        assert_eq!(resolved.style.background_opacity, 180);
+
+        config.widget_instances[0].overrides.background_color = Some([200, 100, 50]);
+        config.widget_instances[0].overrides.background_opacity = Some(0);
+        let resolved = config.resolved_widget(&config.widget_instances[0]).unwrap();
+        assert_eq!(resolved.style.background_color, [200, 100, 50]);
+        assert_eq!(resolved.style.background_opacity, 0);
+    }
+
+    #[test]
+    fn old_widget_styles_load_without_background_fields() {
+        let mut saved: toml::Value = toml::Value::try_from(Config::default()).unwrap();
+        for template in saved["widget_templates"].as_array_mut().unwrap() {
+            let style = template["style"].as_table_mut().unwrap();
+            style.remove("background_color");
+            style.remove("background_opacity");
+        }
+        let loaded: Config = saved.try_into().unwrap();
+        assert_eq!(loaded.widget_templates[0].style.background_opacity, 0);
     }
 
     #[test]
