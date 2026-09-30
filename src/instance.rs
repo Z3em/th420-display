@@ -39,6 +39,7 @@ pub struct OwnerInfo {
     pub uid: u32,
     pub start_ticks: u64,
     pub executable: PathBuf,
+    pub executable_identity: Option<(u64, u64)>,
     pub command_line: String,
     pub lock_path: PathBuf,
     pub socket_path: PathBuf,
@@ -68,6 +69,7 @@ pub enum AcquireError {
 
 pub struct InstanceGuard {
     lock_file: File,
+    owner_path: PathBuf,
     socket_path: PathBuf,
     listener_stop: Arc<AtomicBool>,
     listener: Option<JoinHandle<()>>,
@@ -304,7 +306,7 @@ impl InstanceGuard {
         shutdown_requested: Arc<AtomicBool>,
         daemon_control: Option<Arc<DaemonControl>>,
     ) -> Result<Self, AcquireError> {
-        let mut lock = OpenOptions::new()
+        let lock = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
@@ -317,22 +319,35 @@ impl InstanceGuard {
                     lock_path.display()
                 ))
             })?;
-        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            let owner = read_owner(&lock_path, &socket_path)
-                .filter(validate_owner)
-                .ok_or_else(|| {
-                    AcquireError::Other(
-                        "instance lock is held but its owner metadata is unavailable".into(),
-                    )
-                })?;
-            return Err(AcquireError::Conflict(owner));
-        }
-        {
-            if let Err(error) = write_owner_record(&mut lock) {
+        let deadline = Instant::now() + Duration::from_millis(500);
+        loop {
+            if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                break;
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            if error.kind() != std::io::ErrorKind::WouldBlock {
                 return Err(AcquireError::Other(format!(
-                    "cannot write instance lock: {error}"
+                    "cannot lock {}: {error}",
+                    lock_path.display()
                 )));
             }
+            if let Some(owner) = read_owner(&lock_path, &socket_path).filter(validate_owner) {
+                return Err(AcquireError::Conflict(owner));
+            }
+            if Instant::now() >= deadline {
+                return Err(AcquireError::Other(format!(
+                    "instance lock {} is held but its owner metadata could not be validated; no process was signaled",
+                    lock_path.display()
+                )));
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        {
+            let owner_path = owner_path(&lock_path);
+            let _ = fs::remove_file(&owner_path);
 
             let _ = fs::remove_file(&socket_path);
             let listener = match UnixListener::bind(&socket_path) {
@@ -349,6 +364,12 @@ impl InstanceGuard {
                 let _ = fs::remove_file(&socket_path);
                 return Err(AcquireError::Other(format!(
                     "cannot configure control socket: {error}"
+                )));
+            }
+            if let Err(error) = write_instance_owner(&owner_path) {
+                let _ = fs::remove_file(&socket_path);
+                return Err(AcquireError::Other(format!(
+                    "cannot publish instance owner: {error}"
                 )));
             }
             let listener_stop = Arc::new(AtomicBool::new(false));
@@ -383,6 +404,7 @@ impl InstanceGuard {
             });
             Ok(Self {
                 lock_file: lock,
+                owner_path,
                 socket_path,
                 listener_stop,
                 listener: Some(listener_thread),
@@ -402,7 +424,7 @@ impl Drop for InstanceGuard {
             let _ = listener.join();
         }
         let _ = fs::remove_file(&self.socket_path);
-        let _ = self.lock_file.set_len(0);
+        let _ = fs::remove_file(&self.owner_path);
         let _ = unsafe { libc::flock(self.lock_file.as_raw_fd(), libc::LOCK_UN) };
     }
 }
@@ -659,6 +681,7 @@ fn revalidate_owner(expected: &OwnerInfo) -> Result<OwnerInfo, String> {
         || current.uid != expected.uid
         || current.start_ticks != expected.start_ticks
         || current.executable != expected.executable
+        || current.executable_identity != expected.executable_identity
         || !validate_owner(&current)
     {
         return Err("instance identity changed; refusing to signal it".into());
@@ -670,7 +693,25 @@ fn validate_owner(owner: &OwnerInfo) -> bool {
     owner.uid == effective_uid()
         && process_uid(owner.pid) == Some(owner.uid)
         && process_start_ticks(owner.pid) == Some(owner.start_ticks)
-        && process_executable(owner.pid).as_ref() == Some(&owner.executable)
+        && match owner.executable_identity {
+            Some(identity) => process_executable_identity(owner.pid) == Some(identity),
+            None => process_executable(owner.pid)
+                .as_ref()
+                .is_some_and(|current| legacy_executable_matches(&owner.executable, current)),
+        }
+}
+
+fn legacy_executable_matches(recorded: &Path, current: &Path) -> bool {
+    current == recorded
+        || current
+            .as_os_str()
+            .as_encoded_bytes()
+            .strip_suffix(b" (deleted)")
+            == Some(recorded.as_os_str().as_encoded_bytes())
+}
+
+fn owner_path(lock_path: &Path) -> PathBuf {
+    lock_path.with_extension("owner")
 }
 
 fn instance_paths(kind: InstanceKind) -> Result<(PathBuf, PathBuf), String> {
@@ -702,11 +743,19 @@ fn runtime_dir_is_safe(path: &Path, uid: u32) -> bool {
 }
 
 fn read_owner(lock_path: &Path, socket_path: &Path) -> Option<OwnerInfo> {
-    let metadata = fs::symlink_metadata(lock_path).ok()?;
+    let sidecar = read_owner_file(&owner_path(lock_path), lock_path, socket_path);
+    if sidecar.as_ref().is_some_and(validate_owner) {
+        return sidecar;
+    }
+    read_owner_file(lock_path, lock_path, socket_path)
+}
+
+fn read_owner_file(path: &Path, lock_path: &Path, socket_path: &Path) -> Option<OwnerInfo> {
+    let metadata = fs::symlink_metadata(path).ok()?;
     if !metadata.file_type().is_file() || metadata.uid() != effective_uid() {
         return None;
     }
-    let text = fs::read_to_string(lock_path).ok()?;
+    let text = fs::read_to_string(path).ok()?;
     let field = |name: &str| {
         text.lines()
             .find_map(|line| line.strip_prefix(&format!("{name}=")))
@@ -717,11 +766,17 @@ fn read_owner(lock_path: &Path, socket_path: &Path) -> Option<OwnerInfo> {
     let executable = PathBuf::from(unsafe {
         std::ffi::OsString::from_encoded_bytes_unchecked(hex_decode(field("exe")?).ok()?)
     });
+    let executable_identity = match (field("exe_dev"), field("exe_ino")) {
+        (Some(dev), Some(ino)) => Some((dev.parse().ok()?, ino.parse().ok()?)),
+        (None, None) => None,
+        _ => return None,
+    };
     Some(OwnerInfo {
         pid,
         uid,
         start_ticks,
         executable,
+        executable_identity,
         command_line: process_command_line(pid),
         lock_path: lock_path.to_owned(),
         socket_path: socket_path.to_owned(),
@@ -730,16 +785,47 @@ fn read_owner(lock_path: &Path, socket_path: &Path) -> Option<OwnerInfo> {
 
 #[allow(dead_code)]
 fn read_device_owner(lock_path: &Path) -> Option<OwnerInfo> {
-    read_owner(lock_path, Path::new("<none>"))
+    read_owner_file(lock_path, lock_path, Path::new("<none>"))
 }
 
 fn write_owner_record(lock: &mut File) -> std::io::Result<()> {
+    let record = owner_record()?;
+    lock.set_len(0)?;
+    lock.rewind()?;
+    lock.write_all(record.as_bytes())?;
+    lock.sync_all()
+}
+
+fn write_instance_owner(path: &Path) -> std::io::Result<()> {
+    let record = owner_record()?;
+    let temporary = path.with_extension(format!("owner.{}.tmp", std::process::id()));
+    let _ = fs::remove_file(&temporary);
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&temporary)?;
+        file.write_all(record.as_bytes())?;
+        file.sync_all()?;
+        fs::rename(&temporary, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temporary);
+    }
+    result
+}
+
+fn owner_record() -> std::io::Result<String> {
     let pid = std::process::id();
     let uid = effective_uid();
     let start_ticks = process_start_ticks(pid)
         .ok_or_else(|| std::io::Error::other("cannot read own process start time"))?;
     let executable = process_executable(pid)
         .ok_or_else(|| std::io::Error::other("cannot read own executable"))?;
+    let (exe_dev, exe_ino) = process_executable_identity(pid)
+        .ok_or_else(|| std::io::Error::other("cannot read own executable identity"))?;
     let token = format!(
         "{}-{}-{}",
         pid,
@@ -749,14 +835,10 @@ fn write_owner_record(lock: &mut File) -> std::io::Result<()> {
             .unwrap_or_default()
             .as_nanos()
     );
-    let record = format!(
-        "pid={pid}\nuid={uid}\nstart={start_ticks}\nexe={}\ntoken={token}\n",
+    Ok(format!(
+        "pid={pid}\nuid={uid}\nstart={start_ticks}\nexe={}\nexe_dev={exe_dev}\nexe_ino={exe_ino}\ntoken={token}\n",
         hex_encode(executable.as_os_str().as_encoded_bytes())
-    );
-    lock.set_len(0)?;
-    lock.rewind()?;
-    lock.write_all(record.as_bytes())?;
-    lock.sync_all()
+    ))
 }
 
 fn process_start_ticks(pid: u32) -> Option<u64> {
@@ -778,6 +860,11 @@ fn process_uid(pid: u32) -> Option<u32> {
 
 fn process_executable(pid: u32) -> Option<PathBuf> {
     fs::read_link(format!("/proc/{pid}/exe")).ok()
+}
+
+fn process_executable_identity(pid: u32) -> Option<(u64, u64)> {
+    let metadata = fs::metadata(format!("/proc/{pid}/exe")).ok()?;
+    Some((metadata.dev(), metadata.ino()))
 }
 
 fn process_command_line(pid: u32) -> String {
@@ -840,6 +927,77 @@ mod tests {
         assert!(process_start_ticks(pid).is_some());
         assert_eq!(process_uid(pid), Some(effective_uid()));
         assert!(process_executable(pid).is_some());
+        assert!(process_executable_identity(pid).is_some());
+    }
+
+    #[test]
+    fn replaced_executable_keeps_valid_owner_identity() {
+        let pid = std::process::id();
+        let original = process_executable(pid).unwrap();
+        let owner = OwnerInfo {
+            pid,
+            uid: effective_uid(),
+            start_ticks: process_start_ticks(pid).unwrap(),
+            executable: PathBuf::from("/tmp/old-executable-path"),
+            executable_identity: process_executable_identity(pid),
+            command_line: String::new(),
+            lock_path: PathBuf::new(),
+            socket_path: PathBuf::new(),
+        };
+        assert!(validate_owner(&owner));
+        let mut wrong_identity = owner.clone();
+        wrong_identity.executable_identity = Some((0, 0));
+        assert!(!validate_owner(&wrong_identity));
+        assert!(legacy_executable_matches(&original, &original));
+        let deleted = PathBuf::from(format!("{} (deleted)", original.display()));
+        assert!(legacy_executable_matches(&original, &deleted));
+        assert!(!legacy_executable_matches(
+            Path::new("/tmp/unrelated"),
+            &deleted
+        ));
+    }
+
+    #[test]
+    fn contention_waits_for_owner_metadata_publication() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "th420-owner-publication-{}-{suffix}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let lock_path = directory.join("test.lock");
+        let socket_path = directory.join("test.sock");
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        let metadata_path = owner_path(&lock_path);
+        let publisher = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(75));
+            write_instance_owner(&metadata_path).unwrap();
+            metadata_path
+        });
+        let result = InstanceGuard::try_acquire_paths(
+            lock_path.clone(),
+            socket_path,
+            Arc::new(AtomicBool::new(false)),
+            None,
+        );
+        assert!(matches!(result, Err(AcquireError::Conflict(_))));
+        let metadata_path = publisher.join().unwrap();
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) };
+        fs::remove_file(metadata_path).unwrap();
+        fs::remove_file(lock_path).unwrap();
+        fs::remove_dir(directory).unwrap();
     }
 
     #[test]
@@ -917,10 +1075,12 @@ mod tests {
     #[test]
     fn daemon_telemetry_preserves_last_valid_sample_after_error() {
         let control = DaemonControl::new_starting();
-        assert!(control
-            .command("telemetry", Duration::ZERO)
-            .unwrap_err()
-            .contains("not available"));
+        assert!(
+            control
+                .command("telemetry", Duration::ZERO)
+                .unwrap_err()
+                .contains("not available")
+        );
 
         control.update_telemetry(28.5, 2320);
         let sample = control.command("telemetry", Duration::ZERO).unwrap();
@@ -978,6 +1138,8 @@ mod tests {
             None,
         )
         .unwrap();
+        assert!(owner_path(&lock_path).exists());
+        assert!(fs::read_to_string(&lock_path).unwrap().is_empty());
         let owner = match InstanceGuard::try_acquire_paths(
             lock_path.clone(),
             socket_path.clone(),
