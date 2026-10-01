@@ -53,34 +53,6 @@ imply user verification or a physical-device test unless the note says so.
 
 Automated tests do not establish GUI or hardware acceptance.
 
-- [ ] **Correct coolant telemetry and verify it against the standby readout** —
-  replace the inferred `0x80` temperature decoding with the same-device
-  FanControl plugin's `0x82` query and little-endian centidegrees. Keep the pump
-  query separate. Failed reads invalidate daemon telemetry and remove coolant
-  from live rendering; GUI errors/stale responses clear displayed values.
-  Parser and simulated control-exchange tests cover changing temperatures,
-  including 31 °C, invalid replies, and telemetry recovery. Compare the rebuilt
-  daemon and GUI with the built-in standby readout at multiple temperatures
-  before marking hardware verification complete. Broader validation of the
-  existing pump-speed interpretation also remains pending.
-  Validation: all 265 daemon/GUI tests pass; both release binaries rebuilt.
-  Broad hardware accuracy verification is pending. The user will compare the
-  software and built-in standby readout once the temperature changes
-  significantly; keep this task out of Verified until that comparison.
-  Follow-up: the user reports 30.9 °C in Overview, widget 31 °C, and standby
-  30 °C. The widget difference is explained by rounding to the nearest integer;
-  standby is consistent with truncating the fraction in this observation.
-  Preserve centidegree precision through telemetry, CLI status, Overview, and
-  diagnostics to distinguish integer rounding from a persistent discrepancy.
-  Widget temperatures currently round to the nearest integer; the standby
-  readout's handling of fractional temperatures has not been established.
-  Host follow-up: a fresh rebuilt `--status` query returned 30.86 °C and 2320 RPM
-  while the user reported standby 30 °C. This confirms the `0x82` response
-  prefix works on this device and is consistent with standby truncation. The
-  running GUI was still the replaced 19:10 binary; no daemon was running, so
-  its Overview value was a retained one-time snapshot. Multiple-temperature
-  comparisons remain pending; do not introduce a temperature offset.
-
 - [ ] **Maintain `gui_v2` as the active GUI reimplementation** — `th420-config`
   builds from `src/gui_v2.rs`. Both `src/gui.rs` and `src/gui_overhaul.rs` are
   non-functional artifacts of the old GUI; retain them for comparison until
@@ -478,6 +450,20 @@ Automated tests do not establish GUI or hardware acceptance.
 <!-- Move finished tasks here and add the validation performed. -->
 
 ## Verified
+
+- [x] **Correct coolant telemetry and verify it against the standby readout** —
+  replaced the inferred `0x80` temperature decoding with the `0x82` query and
+  little-endian centidegrees; pump status remains a separate query. Telemetry,
+  CLI status, Overview, and diagnostics preserve hundredths. Failed reads
+  invalidate telemetry and clear displayed values; missing live coolant uses
+  the widget placeholder. Parser, simulated control-exchange, and recovery
+  tests passed as part of the 265-test suite; both release binaries rebuilt.
+  A host query returned 30.86 °C while standby showed 30 °C. On 2026-10-01 the
+  user checked temperature accuracy and accepted the corrected reading:
+  standby rounds down, while app widgets round to the nearest whole degree.
+  Keep the actual decoded temperature; no calibration offset is needed.
+  This acceptance concerns coolant; broader pump-speed validation remains
+  outside this verification.
 
 - [x] **Prevent conflicting GUI and daemon instances** — `th420-config` and the
   continuous `th420-display` daemon use separate per-user advisory locks and

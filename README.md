@@ -140,7 +140,7 @@ the streamed preview.
 
 | ID | Label | Source |
 |---|---|---|
-| `coolant` | COOLANT | HID command `0x80` on ctrl interface |
+| `coolant` | COOLANT | HID command `0x82` on ctrl interface |
 
 ### Discrete GPU (NVIDIA via NVML / AMD via sysfs)
 
@@ -271,7 +271,9 @@ Two HID interfaces detected by packet size:
 **Keep-alive:** frame re-sent every ~800 ms.  
 **Coolant temp:** write `0x82 0x01 0x00 0x80` to ctrl; response bytes 4--5 are
 little-endian hundredths of a degree. This follows the same-device FanControl
-plugin; local hardware verification of the corrected decoder remains pending.
+plugin; the user verified the corrected reading against standby on 2026-10-01.
+Standby rounds down; app widgets round to the nearest whole degree, while
+Overview preserves both decimal places.
 The previous `0x80` temperature interpretation was based on a single matching
 reading and has been removed. Failed reads show unavailable values instead of
 retaining the last temperature.

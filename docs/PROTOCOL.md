@@ -46,8 +46,10 @@ The driver checks the response prefix and rejects temperatures above 100 °C;
 errors include the first eight response bytes for diagnosis. This replacement
 decoder has protocol tests. A local rebuilt `--status` query on 2026-10-01
 returned 30.86 °C (with the expected response prefix) while the user reported
-standby 30 °C, consistent with standby truncating the fraction. Comparisons
-at multiple temperatures remain pending.
+standby 30 °C. On 2026-10-01 the user verified the corrected coolant reading
+and reported that the difference consistently reflects display rounding:
+standby rounds down, while app widgets round to the nearest whole degree.
+Overview and telemetry retain hundredths; no calibration offset is applied.
 
 The previous `0x80` interpretation (`byte[4] - 0x24`) was based on a single
 coincidental 26 °C comparison on 2026-09-14. The user subsequently reported
@@ -244,9 +246,10 @@ stream, standby JPEG persistence, persistent brightness and pump-temperature
 visibility, staged RGBA text color, boot container encoding, boot commit timing,
 and successful native boot installation.
 
-Coolant decoding now follows the independent same-device plugin; the previous
-single-temperature validation was insufficient. Local hardware verification
-of the replacement decoder and broader pump-speed validation remain pending.
+Coolant decoding follows the independent same-device plugin and was accepted
+by the user after hardware comparison on 2026-10-01. The previous
+single-temperature validation was insufficient. Broader pump-speed validation
+remains pending and is not covered by the coolant verification.
 
 Still unknown: response semantics, firmware storage limits, the maximum safe
 live frame rate, the maximum number/size of boot frames, variable boot timing,
