@@ -39,16 +39,24 @@ the same sequence when attaching. Response semantics are not decoded, but a
 response is read and drained after each command; skipping those reads is
 untested.
 
-Coolant query: `80 01 00 80`. The response encodes the integer coolant
-temperature redundantly: bytes 4--5 are `temperature + 0x24` and
-`temperature + 0x25`. For example, the observed prefix
-`80 01 00 80 3e 3f 09 10` reports `26 °C` (`0x3e - 0x24`); bytes 6--7 are
-instead the pump speed (`0x0910` = 2320 RPM).
+Coolant query: `82 01 00 80`. Decode response bytes 4--5 as an unsigned
+little-endian value in hundredths of a degree (e.g. `1c 0c` = 3100 = 31 °C).
+This follows the [same-device FanControl implementation](https://github.com/Plopsi/FanControl.TTTHXXXV2UltraExLT/blob/bd42b77a1340c806a0a9ecd3d3d0470dbdfb54f5/TempSensor.cs#L15-L38).
+The driver checks the response prefix and rejects temperatures above 100 °C;
+errors include the first eight response bytes for diagnosis. This replacement
+decoder has protocol tests. A local rebuilt `--status` query on 2026-10-01
+returned 30.86 °C (with the expected response prefix) while the user reported
+standby 30 °C, consistent with standby truncating the fraction. Comparisons
+at multiple temperatures remain pending.
 
-Hardware-verified on 2026-09-14: a direct `hidraw` query returned that prefix
-while the device's independent standby overlay showed `Liquid 26 °C`. The
-paired bytes must be checked before accepting a reading; behaviour at other
-temperatures is still inferred from this validated sample.
+The previous `0x80` interpretation (`byte[4] - 0x24`) was based on a single
+coincidental 26 °C comparison on 2026-09-14. The user subsequently reported
+26 °C on every software surface while the built-in standby readout showed
+31 °C; that one-point observation did not establish a temperature encoding.
+The `0x80` query remains separate for pump speed: bytes 6--7 are interpreted
+big-endian (`09 10` = 2320 RPM). That pump interpretation also awaits broader
+hardware validation. Failed telemetry reads invalidate the current values
+rather than indefinitely rendering the last successful coolant reading.
 
 ## Live display streaming
 
@@ -231,10 +239,14 @@ could never support a different, undiscovered variable-timing format.
 
 ## Confidence and safety boundary
 
-Confirmed: interface split, initialization sequence, coolant query, live JPEG
+Confirmed: interface split, initialization sequence, live JPEG
 stream, standby JPEG persistence, persistent brightness and pump-temperature
 visibility, staged RGBA text color, boot container encoding, boot commit timing,
 and successful native boot installation.
+
+Coolant decoding now follows the independent same-device plugin; the previous
+single-temperature validation was insufficient. Local hardware verification
+of the replacement decoder and broader pump-speed validation remain pending.
 
 Still unknown: response semantics, firmware storage limits, the maximum safe
 live frame rate, the maximum number/size of boot frames, variable boot timing,

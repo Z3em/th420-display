@@ -93,6 +93,10 @@ struct Cli {
     #[arg(short, long)]
     config: Option<PathBuf>,
 
+    /// Stream a temporary live configuration without owning the daemon instance.
+    #[arg(long, requires = "config")]
+    preview_live: bool,
+
     /// Print device coolant temperature and pump RPM, then exit.
     #[arg(long)]
     status: bool,
@@ -351,6 +355,24 @@ fn decode_boot_gif(
 }
 
 fn validate_cli(cli: &Cli) -> Result<()> {
+    if cli.preview_live && cli.config.is_none() {
+        bail!("--preview-live requires --config");
+    }
+    if cli.preview_live
+        && (cli.replace_existing.is_some()
+            || cli.daemon_control.is_some()
+            || cli.status
+            || cli.upload_standby.is_some()
+            || cli.standby_brightness.is_some()
+            || cli.pump_temp_color.is_some()
+            || cli.pump_temp_overlay.is_some()
+            || cli.upload_boot.is_some()
+            || cli.inspect_boot.is_some()
+            || !cli.play_live_frames.is_empty()
+            || cli.play_live_gif.is_some())
+    {
+        bail!("--preview-live cannot be combined with another device operation");
+    }
     if cli.replace_existing.is_some() && cli.is_one_shot() {
         bail!("--replace-existing applies only to the continuous live daemon");
     }
@@ -429,6 +451,7 @@ impl Cli {
             || !self.play_live_frames.is_empty()
             || self.play_live_gif.is_some()
             || self.daemon_control.is_some()
+            || self.preview_live
     }
 }
 
@@ -456,6 +479,8 @@ fn main() -> Result<()> {
     };
     let interval = Duration::from_millis(cli.interval);
     let config_path = cli.config.unwrap_or_else(default_config_path);
+    let preview_live = cli.preview_live;
+    let preview_brightness = cli.live_brightness;
 
     if cli.status {
         let _device_guard = DeviceGuard::acquire().map_err(anyhow::Error::msg)?;
@@ -463,7 +488,7 @@ fn main() -> Result<()> {
         dev.init()?;
         let status = dev.read_status()?;
         // Stable machine-readable output used by the GUI and useful in scripts.
-        println!("coolant_temp_c={:.1}", status.coolant_temp_c);
+        println!("coolant_temp_c={:.2}", status.coolant_temp_c);
         println!("pump_rpm={}", status.pump_rpm);
         return Ok(());
     }
@@ -622,13 +647,17 @@ fn main() -> Result<()> {
 
     let shutdown_requested = Arc::new(AtomicBool::new(false));
     let daemon_control = DaemonControl::new_starting();
-    let _instance_guard = if let Some(level) = cli.replace_existing {
-        replace_and_acquire_daemon(shutdown_requested.clone(), level, daemon_control.clone())
-            .map_err(anyhow::Error::msg)?
+    let _instance_guard = if preview_live {
+        None
+    } else if let Some(level) = cli.replace_existing {
+        Some(
+            replace_and_acquire_daemon(shutdown_requested.clone(), level, daemon_control.clone())
+                .map_err(anyhow::Error::msg)?,
+        )
     } else {
         match InstanceGuard::try_acquire_daemon(shutdown_requested.clone(), daemon_control.clone())
         {
-            Ok(guard) => guard,
+            Ok(guard) => Some(guard),
             Err(AcquireError::Conflict(owner)) => {
                 bail!("the live daemon is already running:\n{}", owner.describe())
             }
@@ -637,11 +666,15 @@ fn main() -> Result<()> {
     };
     let mut device_guard = Some(DeviceGuard::acquire().map_err(anyhow::Error::msg)?);
 
-    let mut cfg = Config::load(&config_path).unwrap_or_else(|_| {
-        let default = Config::default();
-        let _ = default.save(&config_path);
-        default
-    });
+    let mut cfg = if preview_live {
+        Config::load(&config_path)?
+    } else {
+        Config::load(&config_path).unwrap_or_else(|_| {
+            let default = Config::default();
+            let _ = default.save(&config_path);
+            default
+        })
+    };
     let mut cfg_mtime = file_mtime(&config_path);
 
     println!("Config: {}", config_path.display());
@@ -653,7 +686,11 @@ fn main() -> Result<()> {
     // stream so the control endpoint is reserved for the coolant query below.
     // Re-sending brightness for every frame can leave an ACK queued, which
     // would then be mistaken for a temperature response on the next tick.
-    initial_device.set_brightness(100)?;
+    initial_device.set_brightness(if preview_live {
+        preview_brightness
+    } else {
+        100
+    })?;
     let mut dev = Some(initial_device);
     if !daemon_control.pause_requested() {
         daemon_control.mark_running();
@@ -695,7 +732,11 @@ fn main() -> Result<()> {
                 .and_then(|guard| {
                     let mut reopened = device::Device::open()?;
                     reopened.init()?;
-                    reopened.set_brightness(100)?;
+                    reopened.set_brightness(if preview_live {
+                        preview_brightness
+                    } else {
+                        100
+                    })?;
                     Ok((guard, reopened))
                 }) {
                 Ok((guard, reopened)) => {
@@ -725,7 +766,6 @@ fn main() -> Result<()> {
         }
 
         if last_sensor_update.elapsed() >= interval {
-            let previous_coolant = values.readings.get("coolant").copied();
             values = sensors.read();
             match dev.as_mut().unwrap().read_status() {
                 Ok(status) => {
@@ -735,9 +775,6 @@ fn main() -> Result<()> {
                     daemon_control.update_telemetry(status.coolant_temp_c, status.pump_rpm);
                 }
                 Err(error) => {
-                    if let Some(coolant) = previous_coolant {
-                        values.readings.insert("coolant".to_string(), coolant);
-                    }
                     daemon_control.mark_telemetry_error(error.to_string());
                 }
             }
@@ -777,6 +814,7 @@ mod tests {
             daemon_control: None,
             interval: 800,
             config: None,
+            preview_live: false,
             status: false,
             upload_standby: None,
             standby_brightness: None,
@@ -859,6 +897,14 @@ mod tests {
         let mut options = cli();
         options.inspect_boot = Some("boot.gif".into());
         options.upload_boot = Some("boot.gif".into());
+        assert!(validate_cli(&options).is_err());
+
+        let mut options = cli();
+        options.preview_live = true;
+        assert!(validate_cli(&options).is_err());
+        options.config = Some("preview.toml".into());
+        assert!(validate_cli(&options).is_ok());
+        options.replace_existing = Some(ReplaceExisting::Term);
         assert!(validate_cli(&options).is_err());
     }
 

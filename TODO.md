@@ -17,6 +17,10 @@ Keep each task in exactly one state:
 Move a task between sections instead of duplicating it. Keep a short validation note
 when moving work to `complete`.
 
+The validation notes under older completed tasks describe the checks performed
+at that time; their test counts are not current suite totals. `Complete` does not
+imply user verification or a physical-device test unless the note says so.
+
 ## Identified
 
 - [ ] **Synchronize window and device animation playback** — coordinate animation
@@ -32,8 +36,14 @@ when moving work to `complete`.
 - [ ] **Decide transient Live playback parity** — `gui_overhaul` exposed finite
   GIF playback and frame-sequence streaming with loop/FPS controls. `gui_v2`
   supports animated/streamed backgrounds, but does not yet expose the same
-  finite playback workflow. Decide whether that old workflow is still required
-  or explicitly superseded before closing the GUI parity audit.
+  finite playback workflow. The user is unsure whether this is still needed;
+  decide whether to restore it or explicitly supersede it before closing the
+  GUI parity audit.
+
+- [ ] **Decide desktop integration workflow** — the old `gui.rs` installed a
+  desktop entry and icon on launch. Decide whether `gui_v2` should offer a
+  separate, explicit install/update workflow, leave integration to packaging,
+  or intentionally omit it. Do not silently write desktop files on startup.
 
 ## Confirmed
 
@@ -41,17 +51,45 @@ when moving work to `complete`.
 
 ## In progress
 
-The user approved implementation of these scenarios. Widget sizing, precise
-selection, color editing, media placement, and `gui_v2` parity are being worked
-through together. Automated tests do not establish GUI or hardware acceptance.
+Automated tests do not establish GUI or hardware acceptance.
+
+- [ ] **Correct coolant telemetry and verify it against the standby readout** —
+  replace the inferred `0x80` temperature decoding with the same-device
+  FanControl plugin's `0x82` query and little-endian centidegrees. Keep the pump
+  query separate. Failed reads invalidate daemon telemetry and remove coolant
+  from live rendering; GUI errors/stale responses clear displayed values.
+  Parser and simulated control-exchange tests cover changing temperatures,
+  including 31 °C, invalid replies, and telemetry recovery. Compare the rebuilt
+  daemon and GUI with the built-in standby readout at multiple temperatures
+  before marking hardware verification complete. Broader validation of the
+  existing pump-speed interpretation also remains pending.
+  Validation: all 265 daemon/GUI tests pass; both release binaries rebuilt.
+  Broad hardware accuracy verification is pending. The user will compare the
+  software and built-in standby readout once the temperature changes
+  significantly; keep this task out of Verified until that comparison.
+  Follow-up: the user reports 30.9 °C in Overview, widget 31 °C, and standby
+  30 °C. The widget difference is explained by rounding to the nearest integer;
+  standby is consistent with truncating the fraction in this observation.
+  Preserve centidegree precision through telemetry, CLI status, Overview, and
+  diagnostics to distinguish integer rounding from a persistent discrepancy.
+  Widget temperatures currently round to the nearest integer; the standby
+  readout's handling of fractional temperatures has not been established.
+  Host follow-up: a fresh rebuilt `--status` query returned 30.86 °C and 2320 RPM
+  while the user reported standby 30 °C. This confirms the `0x82` response
+  prefix works on this device and is consistent with standby truncation. The
+  running GUI was still the replaced 19:10 binary; no daemon was running, so
+  its Overview value was a retained one-time snapshot. Multiple-temperature
+  comparisons remain pending; do not introduce a temperature offset.
 
 - [ ] **Maintain `gui_v2` as the active GUI reimplementation** — `th420-config`
-  builds from `src/gui_v2.rs`. Retain `src/gui_overhaul.rs` for comparison until
-  `gui_v2` has reimplemented every required capability; do not merge the two UIs
-  blindly or remove the old implementation prematurely.
+  builds from `src/gui_v2.rs`. Both `src/gui.rs` and `src/gui_overhaul.rs` are
+  non-functional artifacts of the old GUI; retain them for comparison until
+  `gui_v2` has reimplemented every required capability. Do not merge the old
+  UIs blindly or remove their source prematurely.
 
-  Inventory every user workflow in `gui_overhaul`, every supported runtime
-  config field, and relevant CLI-only device operations. Record the equivalent
+  Inventory every user workflow in `gui.rs` and `gui_overhaul.rs`, every
+  supported runtime config field, and relevant CLI-only device operations.
+  Record the equivalent
   `gui_v2` control or mark the old workflow as intentionally superseded, with a
   reason and user-visible replacement. Examine sensor-source editing,
   Undo/Redo, Profiles, Diagnostics, persistent-media controls, and service
@@ -59,169 +97,118 @@ through together. Automated tests do not establish GUI or hardware acceptance.
   Create separate tasks for genuine gaps and add the GUI/config parity check
   already tracked in Identified. Close this umbrella task only when required
   gaps have been implemented and the checklist has been reviewed. Keep the
-  old GUI source until that point.
+  old GUI sources until that point.
 
-  Progress: `gui_v2` now has source label/unit editing, Profiles, Diagnostics,
+  Progress: `gui_v2` now has source label/unit editing, Profiles under Settings,
+  Diagnostics,
   Undo/Redo, fine display rotation, and daemon restart. Widget instance order
   supersedes the old layout/sensor-order workflow; template/instance colors
-  supersede sensor-specific colors. The detailed parity inventory, transient
-  Live playback decision, and GUI validation remain open.
-
-- [ ] **Simplify widget sizing and keep geometry stable** — use explicit local
-  box width and height, with template defaults and optional per-instance
-  overrides. Changing telemetry must not resize the text area, background, or
-  selection box. Center the value and label group inside the box, retain their
-  individual font sizes and relative placement, and provide numerical size
-  controls plus a deliberate Fit to content action and overflow warning. Widget
-  placement needs pan and rotation; remove widget-specific zoom and X/Y stretch
-  from the new model and editor. Backwards compatibility for existing widget
-  scale/stretch settings is not required. Background, Boot, and Standby media
-  transforms are unaffected.
-
-  Add width and height to template style and sparse optional width/height
-  overrides to instances. Resolve them once per render from the template and
-  overrides, never from the current telemetry string. Replace the widget's
-  shared `Transform2D` with widget-only pan/rotation placement while retaining
-  `Transform2D` for backgrounds and persistent media. Use one local rectangle
-  for text layout, optional color fill, rendering pivot, and selection. Center
-  the value-and-label group inside the rectangle while retaining its internal
-  label offsets; preserve half-pixel centers through rotation and rasterization.
-  Set built-in dimensions for representative formatted readings. On Add widget,
-  use the selected template dimensions; duplicated instances retain their own
-  overrides. A Fit to content action should measure the label, the current
-  value (or missing-data placeholder), and a representative value for the
-  bound unit, then add explicit padding and set the instance overrides.
-
-  Expose precise numerical width/height controls, inherited/overridden state,
-  Reset to template, and a non-blocking overflow warning when either rendered
-  text exceeds the box. Reject non-finite or non-positive dimensions, and cap
-  raster dimensions before allocation. Widget configs using the old scale and
-  stretch representation need no compatibility migration; document the config
-  schema change. Test inheritance, independent sibling sizing, value changes
-  such as `99` to `100`, Fit to content, overflow, labels above/below values,
-  transparent and opaque backgrounds, rotation pivot, and serialization.
-
-  Progress: template box dimensions, sparse instance overrides, pan/rotation-
-  only widget placement, stable render bounds, numerical size controls,
-  inheritance reset, Fit to content, and overflow warning are implemented.
-  Visual fit/overflow checks and stronger representative-value coverage remain.
-
-- [ ] **Improve color editing across the GUI** — provide a consistent, larger
-  swatch, editable `#RRGGBB` value, and visual picker for widget labels,
-  thresholds, widget backgrounds, and canvas colors. Keep transparency separate
-  where applicable, preserve template inheritance/reset, and handle incomplete
-  or invalid hex input without changing the saved color.
-
-  Implement a reusable RGB editor in `gui_v2` with a larger swatch, a visual
-  hue/saturation/value popup, and a `#RRGGBB` text field. Keep a per-control
-  draft string keyed by a stable widget/template/threshold identity. Accept a
-  complete six-digit hex value on Enter or focus loss; retain invalid or
-  incomplete drafts with inline feedback while leaving the working color
-  unchanged. Changes from the popup update the desktop preview immediately;
-  Apply retains its existing configuration-save semantics. Reuse the editor
-  for template and instance label colors, threshold rows, widget background
-  colors, and Live/Boot/Standby canvas colors. Keep background transparency
-  as its existing separate 0–100% control, converting only at the UI boundary
-  to the stored 0–255 opacity. A color change to an inherited instance creates
-  only that field's override; Use template clears it.
-
-  Test hex parsing/formatting, draft/commit behavior, RGB conversion, opacity
-  endpoint and round-trip behavior, independent fields and threshold rows,
-  template inheritance, and config save/load. Visually check popup sizing,
-  keyboard editing, and preview updates at the GUI boundary.
-
-  Progress: the reusable swatch/hex/popup editor is wired to widget labels,
-  threshold rows, widget backgrounds, and all three canvas colors. Hex parsing
-  has automated tests; keyboard, popup, inheritance, and transparency behavior
-  still need GUI validation.
-
-- [ ] **Select transformed widgets by their actual box** — hit-test the widget's
-  rotated local box rather than its axis-aligned bounding box.
-  Share geometry with rendering and the selection outline, retain topmost-first
-  behavior for overlaps, and allow a small pointer tolerance. This depends on
-  stable widget geometry.
-
-  Derive the four transformed box corners from the resolved local dimensions
-  and widget pan/rotation in one shared geometry helper. Draw the selection
-  outline from those corners. For pointer hit-testing, map the canvas point
-  through the inverse transform into local box coordinates, using a small
-  tolerance measured in preview pixels. Ignore hidden or unrendered instances,
-  inspect remaining instances in reverse compositing order, and keep a drag
-  active once it starts even if the pointer leaves the box. An instance may
-  still be selected from the list when its media is missing or off-screen.
-  Test rotated empty corners, 0/90/180-degree rotations, fractional centers,
-  edge tolerance at different preview sizes, overlaps, and drag continuity.
-
-  Progress: the outline uses rotated box corners; hit testing inverse-rotates
-  the pointer, uses preview-pixel tolerance, and respects visible/rendered
-  instances and reverse z-order. Full interactive selection checks remain.
-
-- [ ] **Bound and align Live, Boot, and Standby media placement** — use the square
-  480×480 canvas for movement limits and edge alignment; the circular display
-  mask remains visual clipping. In the default relaxed mode, allow the actual
-  transformed image or video frame to move completely out of view, but stop
-  when its outer edge touches the canvas edge: do not allow a gap between them.
-  Exclude rotation padding filled with canvas color when determining the media
-  edge. Provide a **Center image** action that resets pan to `(0, 0)` without
-  changing zoom, stretch, or rotation.
-
-  Offer independent, optional edge snapping for Live backgrounds, Boot media,
-  and Standby media. Within its snap distance, alignment of a transformed
-  media edge with a canvas edge takes precedence over pan-grid snapping on the
-  affected axis; otherwise retain grid snapping. Preview coordinates and
-  committed coordinates must obey the same rule. Also offer an optional
-  **Keep viewport covered** mode that prevents any canvas pixel from falling
-  outside the actual transformed media. If the current scale or rotation
-  cannot cover the canvas, explain the conflict and require an explicit size
-  change rather than silently modifying the transform. Apply the limits to
-  pointer drags and numeric pan controls, with consistent bounds across an
-  animation's frames.
-
-  Extract shared media-footprint geometry from the fit, zoom, stretch, and
-  rotation calculations before canvas-colored rotation padding is added. Work
-  with the transformed source rectangle in center-relative canvas coordinates.
-  In relaxed mode, a candidate pan is valid when that rectangle intersects or
-  touches the square canvas; clamp an invalid candidate to the nearest valid
-  contact position so a fully off-screen image cannot move farther away. In
-  strict mode, require all four canvas corners to lie inside that rectangle.
-  If strict coverage is geometrically impossible, leave the current transform
-  intact and explain which size/rotation change is needed. While strict mode
-  is active, reject scale or rotation edits that would make coverage impossible
-  rather than silently changing zoom. Solid-color Live backgrounds have no
-  media edge and should not show these controls.
-
-  Provide separate edge-snap and strict-coverage toggles for Live, Boot, and
-  Standby, preserving the existing independent grid settings. Use an 8 canvas
-  pixel default edge-snap distance. For a rotated rectangle, align its extreme
-  point on the relevant axis to a canvas edge (tangent contact), not its
-  canvas-colored bounding-box padding. Evaluate edge candidates before grid
-  candidates on each axis, then validate the combined candidate against the
-  selected placement mode. If a grid point is illegal, choose the nearest
-  legal boundary position; the final Drag/Preview readout must equal the stored
-  coordinates on release. Changing snap options must never resnap a committed
-  pan. Center image sets only pan to `(0, 0)`.
-
-  Use the same constraint function for desktop dragging, numeric pan, and
-  device-preview/upload arguments. Derive one legal pan region for every
-  animation frame; if source dimensions can differ, use the intersection of
-  their legal regions. Recompute on source or transform changes without silently
-  moving a committed image. Test exact edge contact, one-pixel gaps, all four
-  sides and corners, rotated contact, strict-mode impossibility, edge-versus-
-  grid precedence, snap changes, animation-frame consistency, and desktop/
-  device-preview geometry equivalence. Follow automated checks with visual
-  preview and physical-device validation; do not mark hardware behavior
-  verified from unit tests alone.
-
-  Progress: source-footprint geometry, relaxed/strict pan regions, edge-before-
-  grid snapping, per-target toggles, Center image, drag/numeric bounds, and
-  geometry-edit rejection are implemented. Boot placement now intersects legal
-  regions across differing animation-frame dimensions. GUI Apply, device
-  preview, and persistent-media uploads now validate placement before sending
-  arguments. Remaining: decide whether direct CLI media transforms should
-  enforce the same optional GUI modes, complete coverage tests, and run
-  visual/device checks.
+  supersede sensor-specific colors. Still needed: a documented old-GUI/config/
+  CLI workflow inventory, disposition of the transient Live playback workflow
+  (tracked in Identified), and interactive validation of the new controls.
 
 ## Complete
+
+- [x] **Restore standby coolant-text controls in `gui_v2`** — Standby now has
+  explicit Keep unchanged / Show / Hide visibility, a separate Apply visibility
+  action, and optional text color committed only by an explicit standby upload.
+  The device exposes no readback for these settings, so the GUI never presents
+  a guessed state as current. The streamed preview does not simulate firmware
+  coolant text. Upload/apply controls are disabled while device preview owns
+  the device. Tests cover omitted defaults and exact color/visibility CLI
+  arguments; physical-device behavior awaits user verification.
+
+- [x] **Add media file drag-and-drop to `gui_v2`** — one local file dropped on
+  Live Background, Boot, or Standby selects that editor's media via the same
+  path as Browse. Boot accepts GIF; Live/Standby accept image or FFmpeg-backed
+  media. Unsupported pages and multi-file drops give explicit errors instead
+  of changing another tab. Tests cover target routing and file validation;
+  interactive drag-and-drop awaits user verification.
+
+- [x] **Move Profiles into Settings and preview unsaved Live Display edits on
+  device** — Profiles now lives in Settings. The global device-preview switch
+  streams the current working configuration on Live Display, follows the Boot
+  or Standby tab for media preview, and remains enabled but idle on unrelated
+  pages. Live preview writes only an atomically replaced private temporary
+  snapshot, bypasses the daemon instance lock while retaining the device lock,
+  and preserves the daemon pause/resume handoff. Tests cover page routing,
+  transient CLI exclusivity, snapshot updates without altering committed
+  config, and the existing Boot/Standby preview paths. GUI and daemon suites,
+  formatting, non-strict Clippy, and release build passed; interactive GUI and
+  device behavior await user verification.
+
+- [x] **Stop automatic offline telemetry helpers and coordinate live startup** —
+  automatic coolant/pump updates now use the running daemon's control socket
+  only. With the daemon off, the GUI labels readings as non-live and offers an
+  explicit one-time snapshot using a bounded `--status` helper. Starting Live
+  Display waits for an in-flight snapshot to finish or time out; the daemon is
+  considered started only after its control state reports `running`, not merely
+  after publishing its instance lock. Coolant is injected into live widgets
+  only from fresh daemon telemetry. Any visible widget with an unavailable or
+  invalid reading now shows `--` and remains selectable; the old `show_missing`
+  setting no longer silently hides it. Automated tests cover offline poll suppression, snapshot
+  timeout, startup readiness, placeholder rendering, and selection. The full
+  138-test GUI binary and 122-test daemon binary suites, formatting, non-strict
+  Clippy, and release builds passed; GUI/device behavior awaits user testing.
+
+- [x] **Improve color editing across the GUI** — one larger swatch, visual RGB
+  picker, and editable `#RRGGBB` field serves widget labels, thresholds,
+  backgrounds, and Live/Boot/Standby canvas colors. Per-control drafts leave
+  invalid or incomplete input uncommitted; template overrides and a separate
+  0–100% transparency control remain available. Validated by hex formatting/
+  parsing, draft/commit, independent-color, inheritance/serialization, and
+  opacity endpoint/round-trip tests. Interactive popup, keyboard, and preview
+  appearance await user verification.
+
+- [x] **Select transformed widgets by their actual box** — shared rotated box
+  geometry drives the outline and inverse-transform hit testing. Selection is
+  topmost-first, ignores hidden/unrendered instances, and keeps an active drag
+  after the pointer leaves the box. Tests cover rotated empty corners,
+  0/90/180-degree angles, fractional centers, overlapping siblings,
+  preview-scaled pointer tolerance, and drag continuity. Interactive selection
+  appearance awaits user verification.
+
+- [x] **Bound and align Live, Boot, and Standby media placement** — shared
+  source-footprint geometry constrains relaxed and strict pan, with optional
+  edge-before-grid snapping and Center image on each media target. Boot uses
+  the intersection of all frame dimensions. GUI drag/numeric controls, Apply,
+  device preview, and explicit upload validate against the same placement
+  rules and pass the same transform arguments. Tests cover exact contact versus
+  one-pixel gaps, all sides and corners, rotated source-edge snapping,
+  impossible strict coverage, multi-frame intersection, and shared preview/
+  upload arguments. Optional edge/coverage preferences are intentionally
+  GUI-only; direct CLI transforms stay unconstrained for scripts, as documented
+  in README. Desktop appearance and physical-device behavior await user
+  verification; no persistent device write was performed.
+
+  Final validation for these three tasks: all 132 GUI-binary and 120 daemon-
+  binary tests passed with the GUI feature enabled; formatting, non-strict
+  Clippy, diff checks, and release builds of both binaries passed.
+
+- [x] **Simplify widget sizing and keep geometry stable** — widget templates
+  define a fixed local width/height; instances may override either dimension
+  independently, and the renderer keeps that box unchanged as readings change.
+  Widgets use center-relative pan/rotation without widget zoom or stretch.
+  The GUI has numerical size controls, Use template size, Fit to content, and
+  a non-blocking overflow warning. The fit calculation includes the current
+  reading, a representative formatted value, the missing-data placeholder,
+  label placement, and padding. The config schema and inheritance rules are
+  documented in README. Validated by config serialization/inheritance tests,
+  `99`/`100` stable-geometry and rotation checks, Fit/overflow tests for labels
+  above and below the value, transparent/opaque raster checks, label-position
+  pixel checks, the full GUI-enabled suite, formatting, non-strict Clippy, and
+  a release build of both binaries.
+  Interactive GUI appearance has not been user-verified; no device write was
+  performed.
+
+- [x] **Keep instance replacement working after executable rebuilds** — owner
+  validation now uses the running executable's device/inode identity in addition
+  to PID, UID, and process start time; legacy lock records also accept Linux's
+  ` (deleted)` suffix. Instance owner metadata is published atomically beside
+  the lock, and competing launches retry briefly during publication. Focused
+  identity, publication-race, and graceful-handoff tests passed, as did the
+  GUI-enabled suite. This follow-up has not been user-verified; the broader
+  single-instance behavior remains separately recorded under Verified.
 
 - [x] **Use center-origin snapping and center-drawn grids for transformed
   content** — formalize `(240, 240)` as the 480x480 canvas origin and represent
@@ -306,8 +293,9 @@ through together. Automated tests do not establish GUI or hardware acceptance.
   widget bounds using the shared center-origin pivot and center-drawn grid,
   retain the `Drag`/`Preview` readout and exact numeric controls, and keep widget
   anchoring, clipping, visibility, and selection handles outside the shared
-  geometry engine. This task depends on both the center-origin foundation and
-  the widget template/instance model being implemented.
+  geometry engine. This task depended on both the center-origin foundation and
+  the widget template/instance model. Subsequent widget-sizing work intentionally
+  narrowed widget placement to pan and rotation; media keeps zoom and stretch.
 
 - [x] **Refresh Boot and Standby device previews after live edits** — device
   preview helpers are now keyed by mode, source path, brightness, the complete
@@ -318,8 +306,9 @@ through together. Automated tests do not establish GUI or hardware acceptance.
   old child before spawning its successor, keeps the live daemon paused across
   the handoff, and clears pending work when preview is disabled. Regression tests
   cover Boot and Standby helper-input invalidation. The full 194-test GUI-enabled
-  suite, Clippy, formatting, diff checks, and release builds pass; perceived
-  device latency and lock handoff await hardware verification.
+  suite, Clippy, formatting, diff checks, and release builds passed at
+  completion; perceived device latency and lock handoff still await hardware
+  verification.
 
 - [x] **Bring Boot and Standby transform controls to Live Display parity** —
   removed the legacy Fit dropdown and gave both media tabs the same `1:1`, `Fit`,
@@ -335,7 +324,8 @@ through together. Automated tests do not establish GUI or hardware acceptance.
   Regression tests cover cross-target preset equivalence, hidden-fit removal,
   guarded Cover defaults, reset semantics, snap independence, and grid changes.
   The full 192-test GUI-enabled suite, Clippy, formatting, diff checks, and release
-  builds pass; visual GUI and physical-device behavior await user verification.
+  builds passed at completion; visual GUI and physical-device behavior await
+  user verification.
 
 - [x] **Rotate transformed media with a natural right-button arc gesture** —
   right-button dragging now rotates Live Display backgrounds, boot media, and
@@ -348,7 +338,7 @@ through together. Automated tests do not establish GUI or hardware acceptance.
   interval changes do not alter committed rotations. Focused tests cover arc
   unwrapping, dead-zone handling, snapping, normalization, release semantics,
   later interval changes, and target-state independence. The full 186-test
-  GUI-enabled suite, Clippy, formatting, diff checks, and release builds pass;
+  GUI-enabled suite, Clippy, formatting, diff checks, and release builds passed;
   visual interaction and physical-device behavior await user verification.
 
 - [x] **Make device preview tab-driven and pause the daemon while it owns the
@@ -374,9 +364,9 @@ through together. Automated tests do not establish GUI or hardware acceptance.
   native-source canvas fill, transform/cache-layer invalidation, identical
   trimmed-frame and normalized-timing behavior between boot upload preparation
   and transient device preview, and the explicit nonfatal error for media that
-  requires a missing optional FFmpeg installation. The full GUI-enabled suite now
-  passes 168 tests. Widget adapter equivalence remains part of the planned shared
-  widget-transform task because the template/instance model does not exist yet.
+  requires a missing optional FFmpeg installation. The full GUI-enabled suite
+  passed 168 tests at completion. Widget adapters were subsequently implemented
+  with the template/instance model and later narrowed to pan/rotation placement.
   Formatting, Clippy, diff checks, and release builds passed; visual GUI testing
   and any persistent device upload remain user-controlled validation boundaries.
 
@@ -412,9 +402,10 @@ through together. Automated tests do not establish GUI or hardware acceptance.
   daemon stop/start results are checked before device operations continue, and
   failed preview exits are reported. Boot-container inspection is serialized so
   rapid transform edits cannot accumulate CPU-heavy `th420-display` helpers.
-  Device choices are now Off, Boot (loop), Boot (once), and Standby; loop/once
-  semantics apply only to boot animation. Validated by the GUI-enabled tests,
-  Clippy, format/diff checks, process inspection, and release builds.
+  At that stage, device choices were Off, Boot (loop), Boot (once), and Standby;
+  the later tab-driven preview task replaced this selector with one On/Off switch.
+  Loop/once semantics apply only to boot animation. Validated by GUI-enabled
+  tests, Clippy, format/diff checks, process inspection, and release builds.
 
 - [x] **Restore animated live-display cadence** — animated background rendering
   is independent of the default 800 ms sensor interval. GIF source delays are

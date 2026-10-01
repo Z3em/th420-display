@@ -969,13 +969,28 @@ impl Renderer {
             && local_y.abs() <= widget.style.height / 2.0 + tolerance
     }
 
-    pub fn widget_content_size(
+    pub fn widget_fit_size(
         &self,
         widget: &crate::config::ResolvedWidget,
-        value: &str,
+        current: &str,
+        representative: &str,
     ) -> Option<[f32; 2]> {
         let font = FontRef::try_from_slice(&self.font_bytes).ok()?;
-        Some(widget_layer_dimensions(&font, widget, value))
+        let mut required = [0.0_f32, 0.0_f32];
+        for value in [current, representative, "--"] {
+            let size = widget_layer_dimensions(&font, widget, value);
+            required[0] = required[0].max(size[0]);
+            required[1] = required[1].max(size[1]);
+        }
+        Some(required)
+    }
+
+    pub fn widget_content_overflows(
+        &self,
+        widget: &crate::config::ResolvedWidget,
+        required: [f32; 2],
+    ) -> bool {
+        required[0] > widget.style.width || required[1] > widget.style.height
     }
 
     fn render_base(&self, config: &Config, v: &SensorValues) -> RgbImage {
@@ -1017,10 +1032,11 @@ impl Renderer {
                 if !widget.visible {
                     continue;
                 }
-                let raw = v.readings.get(&widget.source_id).copied();
-                if raw.is_none() && !widget.style.show_missing {
-                    continue;
-                }
+                let raw = v
+                    .readings
+                    .get(&widget.source_id)
+                    .copied()
+                    .filter(|value| value.is_finite());
                 draw_widget_instance(&mut img, &font, &widget, raw);
             }
             return img;
@@ -1641,6 +1657,129 @@ mod tests {
     }
 
     #[test]
+    fn widget_fit_accounts_for_current_representative_and_missing_values() {
+        let config = Config::default();
+        let mut widget = config.resolved_widget(&config.widget_instances[0]).unwrap();
+        let renderer = Renderer::new();
+        let font = FontRef::try_from_slice(FONT_BYTES).unwrap();
+        for label_above in [false, true] {
+            widget.style.label_offset_y = if label_above { -10.0 } else { 10.0 };
+            let fit = renderer.widget_fit_size(&widget, "99", "100").unwrap();
+            for value in ["99", "100", "--"] {
+                let measured = widget_layer_dimensions(&font, &widget, value);
+                assert!(fit[0] >= measured[0] && fit[1] >= measured[1]);
+            }
+            widget.style.width = fit[0].ceil();
+            widget.style.height = fit[1].ceil();
+            assert!(!renderer.widget_content_overflows(&widget, fit));
+            widget.style.width = fit[0] - 1.0;
+            assert!(renderer.widget_content_overflows(&widget, fit));
+            widget.style.width = fit[0].ceil();
+            widget.style.height = fit[1] - 1.0;
+            assert!(renderer.widget_content_overflows(&widget, fit));
+        }
+    }
+
+    #[test]
+    fn widget_box_rendering_keeps_transparent_and_opaque_edges() {
+        let config = Config::default();
+        let mut widget = config.resolved_widget(&config.widget_instances[0]).unwrap();
+        widget.label.clear();
+        widget.style.width = 101.0;
+        widget.style.height = 81.0;
+        widget.style.background_color = [240, 0, 0];
+        widget.transform.pan_x = 0.0;
+        widget.transform.pan_y = 0.0;
+        widget.transform.rotation = 0.0;
+        let font = FontRef::try_from_slice(FONT_BYTES).unwrap();
+        let mut render = |opacity| {
+            widget.style.background_opacity = opacity;
+            let mut canvas = RgbImage::from_pixel(480, 480, Rgb([0, 0, 0]));
+            draw_widget_instance(&mut canvas, &font, &widget, Some(25.0));
+            canvas
+        };
+        let transparent = render(0);
+        let opaque = render(255);
+        assert_eq!(*transparent.get_pixel(191, 201), Rgb([0, 0, 0]));
+        assert_eq!(*opaque.get_pixel(191, 201), Rgb([240, 0, 0]));
+    }
+
+    #[test]
+    fn widget_label_stays_on_requested_side_of_value() {
+        let config = Config::default();
+        let mut widget = config.resolved_widget(&config.widget_instances[0]).unwrap();
+        widget.label = "LABEL".to_string();
+        widget.style.width = 220.0;
+        widget.style.height = 160.0;
+        widget.style.label_color = [255, 0, 0];
+        widget.style.color_map = vec![crate::config::ColorPoint {
+            value: 0.0,
+            color: [0, 255, 0],
+        }];
+        widget.transform.pan_x = 0.0;
+        widget.transform.pan_y = 0.0;
+        widget.transform.rotation = 0.0;
+        let font = FontRef::try_from_slice(FONT_BYTES).unwrap();
+        for (offset, above) in [(-10.0, true), (10.0, false)] {
+            widget.style.label_offset_y = offset;
+            let mut canvas = RgbImage::from_pixel(480, 480, Rgb([0, 0, 0]));
+            draw_widget_instance(&mut canvas, &font, &widget, Some(25.0));
+            let color_center_y = |is_label: bool| {
+                let ys: Vec<u32> = canvas
+                    .enumerate_pixels()
+                    .filter_map(|(_, y, pixel)| {
+                        let selected = if is_label {
+                            pixel[0] > 100 && pixel[1] < 30
+                        } else {
+                            pixel[1] > 100 && pixel[0] < 30
+                        };
+                        selected.then_some(y)
+                    })
+                    .collect();
+                assert!(!ys.is_empty());
+                ys.iter().sum::<u32>() as f32 / ys.len() as f32
+            };
+            let label_y = color_center_y(true);
+            let value_y = color_center_y(false);
+            assert_eq!(label_y < value_y, above);
+            assert!((label_y + value_y) / 2.0 > 190.0);
+            assert!((label_y + value_y) / 2.0 < 290.0);
+        }
+    }
+
+    #[test]
+    fn every_missing_widget_renders_placeholder_instead_of_disappearing() {
+        let mut renderer = Renderer::new();
+        for source in ["coolant", "cpu_temp"] {
+            let mut config = Config::default();
+            config
+                .widget_instances
+                .retain(|instance| instance.source_id == source);
+            assert_eq!(config.widget_instances.len(), 1);
+            let missing = SensorValues {
+                readings: HashMap::new(),
+            };
+            let placeholder = renderer.render_preview(&config, &missing);
+            let instance = config.widget_instances[0].clone();
+            config.widget_instances.clear();
+            let hidden = renderer.render_preview(&config, &missing);
+            assert_ne!(placeholder, hidden, "missing {source} widget disappeared");
+
+            let mut live = SensorValues {
+                readings: HashMap::new(),
+            };
+            live.readings.insert(source.into(), 28.5);
+            let mut invalid = SensorValues {
+                readings: HashMap::new(),
+            };
+            invalid.readings.insert(source.into(), f32::NAN);
+            config.widget_instances.push(instance);
+            assert_eq!(placeholder, renderer.render_preview(&config, &invalid));
+            assert_ne!(placeholder, renderer.render_preview(&config, &live));
+        }
+    }
+
+    #[test]
     fn widget_geometry_does_not_change_with_telemetry() {
         let mut config = Config::default();
         let id = config.widget_instances[0].id.clone();
@@ -1700,6 +1839,87 @@ mod tests {
         )
         .unwrap();
         assert!(rotated.pan_region(true).is_err());
+    }
+
+    #[test]
+    fn relaxed_media_limits_allow_contact_but_not_a_one_pixel_gap() {
+        let footprint =
+            MediaFootprint::new((480, 480), &ImageFit::Native, &Transform2D::default()).unwrap();
+        let region = footprint.pan_region(false).unwrap();
+        for candidate in [
+            [480.0, 0.0],
+            [-480.0, 0.0],
+            [0.0, 480.0],
+            [0.0, -480.0],
+            [480.0, 480.0],
+            [480.0, -480.0],
+            [-480.0, 480.0],
+            [-480.0, -480.0],
+        ] {
+            assert_eq!(region.clamp(candidate), candidate);
+        }
+        for (outside, expected) in [
+            ([481.0, 0.0], [480.0, 0.0]),
+            ([-481.0, 0.0], [-480.0, 0.0]),
+            ([0.0, 481.0], [0.0, 480.0]),
+            ([0.0, -481.0], [0.0, -480.0]),
+            ([481.0, 481.0], [480.0, 480.0]),
+        ] {
+            assert_eq!(region.clamp(outside), expected);
+        }
+    }
+
+    #[test]
+    fn rotated_media_edge_snap_uses_source_corners_and_strict_coverage() {
+        let transform = Transform2D {
+            rotation: 30.0,
+            ..Transform2D::default()
+        };
+        let footprint = MediaFootprint::new((300, 200), &ImageFit::Native, &transform).unwrap();
+        let max_x = footprint
+            .corners
+            .iter()
+            .map(|corner| corner[0])
+            .fold(f32::NEG_INFINITY, f32::max);
+        let right_contact = 240.0 - max_x;
+        assert_eq!(
+            footprint.edge_snap([right_contact - 2.0, 0.0], 8.0)[0],
+            Some(right_contact)
+        );
+        let min_x = footprint
+            .corners
+            .iter()
+            .map(|corner| corner[0])
+            .fold(f32::INFINITY, f32::min);
+        let outer_contact = 240.0 - min_x;
+        let region = footprint.pan_region(false).unwrap();
+        let clamped = region.clamp([outer_contact + 1.0, 0.0]);
+        assert!((clamped[0] - outer_contact).abs() < 0.01);
+
+        assert!(MediaFootprint::new(
+            (480, 480),
+            &ImageFit::Native,
+            &Transform2D {
+                rotation: 45.0,
+                ..Transform2D::default()
+            }
+        )
+        .unwrap()
+        .pan_region(true)
+        .is_err());
+        let enlarged = MediaFootprint::new(
+            (480, 480),
+            &ImageFit::Native,
+            &Transform2D {
+                zoom: 1.5,
+                rotation: 45.0,
+                ..Transform2D::default()
+            },
+        )
+        .unwrap();
+        let covered = enlarged.pan_region(true).unwrap();
+        let centered = covered.clamp([0.0, 0.0]);
+        assert!(centered[0].abs() < 0.01 && centered[1].abs() < 0.01);
     }
 
     #[test]

@@ -8,7 +8,7 @@ No official Linux driver exists — protocol fully reverse-engineered without Wi
 
 ## Screenshots
 
-> **Note:** The GUI preview shows all sensors except coolant temperature — the AIO pump must be connected for the coolant reading to appear. After applying settings, coolant temp is correctly rendered on the device screen (see photos below).
+> **Note:** The coolant widget shows `--` when live daemon telemetry is unavailable, including while the daemon is paused for a device preview.
 
 ### GUI configurator
 
@@ -101,6 +101,28 @@ make appimage
 - **Live preview** — 480×480 preview updates every 800 ms with real sensor values
 - **Config hot-reload** — daemon picks up changes instantly on every save
 
+Coolant and pump telemetry is live only while the daemon is running. The GUI
+reads it through the daemon's control socket. With the daemon stopped, the GUI
+does not poll the device automatically; **Take one-time snapshot** performs an
+explicit, time-limited read. Starting Live Display waits for any snapshot in
+progress to finish, so the two operations do not compete for the device. The
+visible widgets show `--` whenever their reading is unavailable or invalid;
+an offline snapshot is not presented as a live widget value. The old
+`show_missing` widget setting is ignored and removed when configuration is saved.
+
+Profiles are under Settings. The global device-preview switch above Display
+Preview follows the active page: Live Display streams the current unsaved edits,
+Boot and Standby preview their selected media, and other pages leave the switch
+idle. Live preview uses a private temporary configuration and does not apply or
+save those edits. Turning preview off resumes a daemon that the GUI paused.
+
+Drop one local media file onto Live Background, Boot, or Standby to select it;
+the Browse buttons remain available. Boot requires a GIF. In Standby, device
+coolant-text visibility defaults to **Keep unchanged**, and text color is only
+sent when explicitly enabled and a standby image is uploaded. The device does
+not provide readback for either setting, and its firmware text is not shown in
+the streamed preview.
+
 ---
 
 ## Sensors
@@ -162,6 +184,35 @@ Path: `~/.config/th420-display/config.toml`
 The daemon hot-reloads the config on every file modification. The GUI writes changes
 immediately — no manual save step needed.
 
+### Widget sizing schema
+
+The active widget model uses `widget_model_version = 1`, `[[widget_templates]]`,
+and `[[widget_instances]]`. A template's `[widget_templates.style]` has `width`
+and `height` in 480×480 canvas pixels. Each instance can set `width` and
+`height` independently in `[widget_instances.overrides]`; omit either key to
+inherit that dimension from its template. The built-in template defaults to
+180×100 pixels. Widget placement is center-relative: `transform.pan_x = 0` and
+`transform.pan_y = 0` center the box at canvas pixel `(240, 240)`, while
+`transform.rotation` rotates it around that center. Widget placement has no
+zoom or X/Y stretch fields; those remain available for background, Boot, and
+Standby media. The box stays the same size as telemetry values change.
+
+The GUI's **Fit to content** action sets instance width/height overrides using
+the current reading, a representative formatted reading, the missing-value
+placeholder, the label, and padding. **Use template size** clears both size
+overrides. The overflow warning compares measured text with the resolved box;
+the box itself does not grow automatically. A widget background uses
+`background_color = [red, green, blue]` and `background_opacity` from 0
+(transparent) to 255 (opaque). Old widget zoom/stretch keys are not part of the
+new schema and are not migrated.
+
+Live, Boot, and Standby media editors constrain drag and numeric pan to the
+actual transformed source footprint, optionally snap its edges, and can require
+the whole square canvas to stay covered. These are GUI editing preferences, not
+new CLI transform flags: direct CLI media transforms remain unconstrained for
+scripted use. The GUI validates its chosen placement before device preview or
+an explicit upload, using the same transform arguments for both.
+
 ---
 
 ## Persistent LCD media
@@ -218,8 +269,12 @@ Two HID interfaces detected by packet size:
 
 **Frame:** JPEG split into 1020-byte chunks, each prefixed with `[0x08, idx, 0x00, 0x80/0x00]`.  
 **Keep-alive:** frame re-sent every ~800 ms.  
-**Coolant temp:** write `0x80 0x01 0x00 0x80` to ctrl; response bytes 4--5 are
-redundant integer encodings: `byte[4] - 0x24` gives °C.
+**Coolant temp:** write `0x82 0x01 0x00 0x80` to ctrl; response bytes 4--5 are
+little-endian hundredths of a degree. This follows the same-device FanControl
+plugin; local hardware verification of the corrected decoder remains pending.
+The previous `0x80` temperature interpretation was based on a single matching
+reading and has been removed. Failed reads show unavailable values instead of
+retaining the last temperature.
 
 ---
 

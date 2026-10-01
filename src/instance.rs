@@ -161,7 +161,9 @@ impl DaemonControl {
     }
 
     pub fn mark_telemetry_error(&self, error: String) {
-        self.status.lock().unwrap().telemetry_error = Some(error);
+        let mut status = self.status.lock().unwrap();
+        status.telemetry = None;
+        status.telemetry_error = Some(error);
     }
 
     fn stop(&self) {
@@ -196,7 +198,7 @@ impl DaemonControl {
                         .unwrap_or_else(|| "device telemetry is not available yet".into()));
                 };
                 return Ok(format!(
-                    "coolant_temp_c={:.1}\npump_rpm={}\nage_ms={}",
+                    "coolant_temp_c={:.2}\npump_rpm={}\nage_ms={}",
                     telemetry.coolant_temp_c,
                     telemetry.pump_rpm,
                     telemetry.updated_at.elapsed().as_millis()
@@ -1073,21 +1075,27 @@ mod tests {
     }
 
     #[test]
-    fn daemon_telemetry_preserves_last_valid_sample_after_error() {
+    fn daemon_telemetry_invalidates_failed_reading_and_recovers() {
         let control = DaemonControl::new_starting();
         assert!(control
             .command("telemetry", Duration::ZERO)
             .unwrap_err()
             .contains("not available"));
 
-        control.update_telemetry(28.5, 2320);
+        control.update_telemetry(30.97, 2320);
         let sample = control.command("telemetry", Duration::ZERO).unwrap();
-        assert!(sample.contains("coolant_temp_c=28.5"));
+        assert!(sample.contains("coolant_temp_c=30.97\n"));
         assert!(sample.contains("pump_rpm=2320"));
 
         control.mark_telemetry_error("temporary read failure".into());
-        let retained = control.command("telemetry", Duration::ZERO).unwrap();
-        assert!(retained.contains("coolant_temp_c=28.5"));
+        assert_eq!(
+            control.command("telemetry", Duration::ZERO).unwrap_err(),
+            "temporary read failure"
+        );
+        control.update_telemetry(31.0, 2400);
+        let recovered = control.command("telemetry", Duration::ZERO).unwrap();
+        assert!(recovered.contains("coolant_temp_c=31.0"));
+        assert!(recovered.contains("pump_rpm=2400"));
     }
 
     #[test]

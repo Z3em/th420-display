@@ -1,4 +1,4 @@
-use crate::instance::{current_owner, request_graceful, InstanceKind};
+use crate::instance::{current_owner, request_daemon_command, request_graceful, InstanceKind};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -119,7 +119,7 @@ impl ServiceManager {
             }
             BackendKind::Unmanaged => spawn_reaped(daemon),
         };
-        requested && wait_for_daemon_start(Duration::from_secs(3))
+        requested && wait_for_daemon_start(Duration::from_secs(5))
     }
 
     pub fn stop(&self) -> bool {
@@ -281,17 +281,33 @@ fn wait_for_daemon_stop(timeout: Duration) -> bool {
 fn wait_for_daemon_start(timeout: Duration) -> bool {
     let deadline = std::time::Instant::now() + timeout;
     while std::time::Instant::now() < deadline {
-        if current_owner(InstanceKind::Daemon).is_some() {
-            return true;
+        if let Some(owner) = current_owner(InstanceKind::Daemon) {
+            if request_daemon_command(&owner, "state", Duration::from_millis(200))
+                .is_ok_and(|state| daemon_state_is_ready(&state))
+            {
+                return true;
+            }
         }
         std::thread::sleep(Duration::from_millis(50));
     }
     false
 }
 
+fn daemon_state_is_ready(state: &str) -> bool {
+    state == "running"
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_waits_for_running_state_not_just_an_instance_lock() {
+        for state in ["starting", "pausing", "paused", "stopping"] {
+            assert!(!daemon_state_is_ready(state));
+        }
+        assert!(daemon_state_is_ready("running"));
+    }
 
     #[test]
     fn pid1_comm_selects_supported_backends() {

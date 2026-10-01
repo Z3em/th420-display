@@ -295,8 +295,6 @@ pub struct WidgetStyle {
     pub background_color: [u8; 3],
     #[serde(default)]
     pub background_opacity: u8,
-    #[serde(default)]
-    pub show_missing: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
@@ -331,7 +329,6 @@ pub struct WidgetOverrides {
     pub color_map: Option<Vec<ColorPoint>>,
     pub background_color: Option<[u8; 3]>,
     pub background_opacity: Option<u8>,
-    pub show_missing: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -377,7 +374,6 @@ pub fn builtin_sensor_template() -> WidgetTemplate {
             color_map: pct_map(),
             background_color: [0, 0, 0],
             background_opacity: 0,
-            show_missing: false,
         },
     }
 }
@@ -878,9 +874,6 @@ impl Config {
         if let Some(value) = overrides.background_opacity {
             style.background_opacity = value;
         }
-        if let Some(value) = overrides.show_missing {
-            style.show_missing = value;
-        }
         Some(ResolvedWidget {
             id: instance.id.clone(),
             name: instance.name.clone(),
@@ -934,7 +927,6 @@ impl Config {
                 color_map: source.color_map.clone(),
                 background_color: [0, 0, 0],
                 background_opacity: 0,
-                show_missing: false,
             };
             let height = widget_local_height(&style);
             let min_y = effective_label_offset_y(&style).min(0.0);
@@ -965,7 +957,6 @@ impl Config {
                     color_map: Some(style.color_map),
                     background_color: None,
                     background_opacity: None,
-                    show_missing: None,
                 },
             });
         }
@@ -1425,6 +1416,25 @@ mod tests {
         let resolved = config.resolved_widget(&config.widget_instances[0]).unwrap();
         assert_eq!(resolved.style.background_color, [200, 100, 50]);
         assert_eq!(resolved.style.background_opacity, 0);
+    }
+
+    #[test]
+    fn legacy_show_missing_keys_do_not_hide_unavailable_widgets() {
+        let mut saved: toml::Value = toml::Value::try_from(Config::default()).unwrap();
+        saved["widget_templates"][0]["style"]
+            .as_table_mut()
+            .unwrap()
+            .insert("show_missing".into(), toml::Value::Boolean(false));
+        saved["widget_instances"][0].as_table_mut().unwrap().insert(
+            "overrides".into(),
+            toml::Value::Table(toml::map::Map::from_iter([(
+                "show_missing".into(),
+                toml::Value::Boolean(false),
+            )])),
+        );
+        let loaded: Config = saved.try_into().unwrap();
+        let rewritten = toml::to_string(&loaded).unwrap();
+        assert!(!rewritten.contains("show_missing"));
     }
 
     #[test]

@@ -40,17 +40,15 @@ enum Page {
     Overview,
     LiveDisplay,
     StandbySettings,
-    Profiles,
     Diagnostics,
     Settings,
 }
 
 impl Page {
-    const ALL: [(Page, &'static str); 6] = [
+    const ALL: [(Page, &'static str); 5] = [
         (Page::Overview, "Overview"),
         (Page::LiveDisplay, "Live Display"),
         (Page::StandbySettings, "Standby Settings"),
-        (Page::Profiles, "Profiles"),
         (Page::Diagnostics, "Diagnostics"),
         (Page::Settings, "Settings"),
     ];
@@ -60,6 +58,30 @@ impl Page {
 enum LiveTab {
     Background,
     Overlay,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MediaDropTarget {
+    LiveBackground,
+    BootAnimation,
+    StandbyMedia,
+}
+
+fn media_drop_target(
+    page: Page,
+    live_tab: LiveTab,
+    standby_tab: StandbyTab,
+) -> Option<MediaDropTarget> {
+    match page {
+        Page::LiveDisplay if live_tab == LiveTab::Background => {
+            Some(MediaDropTarget::LiveBackground)
+        }
+        Page::StandbySettings => Some(match standby_tab {
+            StandbyTab::Boot => MediaDropTarget::BootAnimation,
+            StandbyTab::Standby => MediaDropTarget::StandbyMedia,
+        }),
+        _ => None,
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -86,6 +108,7 @@ impl PreviewMode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DevicePreviewMode {
     Off,
+    LiveDisplay,
     BootLoop,
     Standby,
 }
@@ -94,6 +117,7 @@ impl DevicePreviewMode {
     fn label(self) -> &'static str {
         match self {
             Self::Off => "Off",
+            Self::LiveDisplay => "Live Display",
             Self::BootLoop => "Boot (loop)",
             Self::Standby => "Standby",
         }
@@ -267,8 +291,10 @@ struct App {
     device_pump_rpm: Option<u16>,
     device_status_error: Option<String>,
     device_status_pending: bool,
-    device_status_tx: Sender<Result<DeviceTelemetry, String>>,
-    device_status_rx: Receiver<Result<DeviceTelemetry, String>>,
+    device_status_live: bool,
+    pending_live_start: bool,
+    device_status_tx: Sender<Result<(DeviceTelemetry, bool), String>>,
+    device_status_rx: Receiver<Result<(DeviceTelemetry, bool), String>>,
     last_device_status_request: Instant,
     last_device_scan: Instant,
 
@@ -285,6 +311,8 @@ struct App {
     live_snap: SnapSettings,
     boot_snap: SnapSettings,
     standby_snap: SnapSettings,
+    standby_overlay: Option<bool>,
+    standby_text_color: Option<[u8; 3]>,
     background_drag: Option<DragSnapState>,
     boot_drag: Option<DragSnapState>,
     standby_drag: Option<DragSnapState>,
@@ -326,6 +354,8 @@ struct App {
     last_boot_inspection_change: Instant,
     stream_path: Option<PathBuf>,
     device_preview_job: Option<DevicePreviewJob>,
+    live_preview_dir: Option<tempfile::TempDir>,
+    last_live_preview_config: Option<Config>,
     pending_device_preview_spec: Option<DevicePreviewSpec>,
     last_device_preview_spec_change: Instant,
     device_preview_refresh_now: bool,
@@ -561,6 +591,8 @@ impl App {
             device_pump_rpm: None,
             device_status_error: None,
             device_status_pending: false,
+            device_status_live: false,
+            pending_live_start: false,
             device_status_tx,
             device_status_rx,
             last_device_status_request: Instant::now() - Duration::from_secs(10),
@@ -576,6 +608,8 @@ impl App {
             live_snap: SnapSettings::default(),
             boot_snap: SnapSettings::default(),
             standby_snap: SnapSettings::default(),
+            standby_overlay: None,
+            standby_text_color: None,
             background_drag: None,
             boot_drag: None,
             standby_drag: None,
@@ -616,6 +650,8 @@ impl App {
             last_boot_inspection_change: Instant::now(),
             stream_path: None,
             device_preview_job: None,
+            live_preview_dir: None,
+            last_live_preview_config: None,
             pending_device_preview_spec: None,
             last_device_preview_spec_change: Instant::now(),
             device_preview_refresh_now: false,
@@ -623,14 +659,18 @@ impl App {
             last_error: None,
         };
         app.refresh_sensors();
-        app.start_device_status_refresh();
+        if daemon_running && !daemon_paused {
+            app.start_device_status_refresh(false);
+        }
         app
     }
 
     fn refresh_sensors(&mut self) {
         let mut values = self.sensors.read();
-        if let Some(value) = self.device_coolant {
-            values.readings.insert("coolant".to_string(), value);
+        if self.device_status_live && self.daemon_running && !self.daemon_paused {
+            if let Some(value) = self.device_coolant {
+                values.readings.insert("coolant".to_string(), value);
+            }
         }
         self.sensor_values = values;
     }
@@ -639,9 +679,13 @@ impl App {
         while let Ok(result) = self.device_status_rx.try_recv() {
             self.device_status_pending = false;
             match result {
-                Ok(telemetry) => {
+                Ok((telemetry, live)) => {
                     self.device_coolant = Some(telemetry.coolant_temp_c);
                     self.device_pump_rpm = Some(telemetry.pump_rpm);
+                    self.device_status_live = live
+                        && self.daemon_running
+                        && !self.daemon_paused
+                        && telemetry.age_ms <= 3_000;
                     self.device_status_error = if telemetry.age_ms > 3_000 {
                         Some(format!(
                             "Device telemetry is stale ({} ms old)",
@@ -650,15 +694,35 @@ impl App {
                     } else {
                         None
                     };
+                    if telemetry.age_ms > 3_000 {
+                        self.device_coolant = None;
+                        self.device_pump_rpm = None;
+                    }
                     self.refresh_sensors();
                 }
-                Err(error) => self.device_status_error = Some(error),
+                Err(error) => {
+                    self.device_status_live = false;
+                    self.device_coolant = None;
+                    self.device_pump_rpm = None;
+                    self.device_status_error = Some(error);
+                    self.refresh_sensors();
+                }
             }
         }
-        if !self.device_status_pending
-            && self.last_device_status_request.elapsed() >= Duration::from_secs(1)
-        {
-            self.start_device_status_refresh();
+        if self.pending_live_start && !self.device_status_pending {
+            self.pending_live_start = false;
+            if self.live_display_enabled {
+                self.start_live_daemon();
+            }
+        }
+        if live_telemetry_poll_due(
+            self.daemon_running,
+            self.daemon_paused,
+            self.device_preview_job.is_some(),
+            self.device_status_pending,
+            self.last_device_status_request.elapsed(),
+        ) {
+            self.start_device_status_refresh(false);
         }
         if self.last_sensor_update.elapsed() >= Duration::from_secs(1) {
             self.refresh_sensors();
@@ -672,6 +736,10 @@ impl App {
                 })
                 .is_some_and(|state| state == "paused");
             self.last_daemon_check = Instant::now();
+            if !self.daemon_running || self.daemon_paused {
+                self.device_status_live = false;
+                self.refresh_sensors();
+            }
         }
         if self.last_device_scan.elapsed() >= Duration::from_secs(4) {
             self.device_info = detect_device_info();
@@ -908,9 +976,21 @@ impl App {
         if status.success() {
             self.status_text = format!("{} preview finished", job.spec.mode.label());
         } else {
+            let detail = self
+                .live_preview_dir
+                .as_ref()
+                .filter(|_| job.spec.mode == DevicePreviewMode::LiveDisplay)
+                .and_then(|dir| std::fs::read_to_string(dir.path().join("stderr.log")).ok())
+                .unwrap_or_default();
+            let detail = detail.trim();
             self.last_error = Some(format!(
-                "{} preview process exited with {status}",
-                job.spec.mode.label()
+                "{} preview process exited with {status}{}",
+                job.spec.mode.label(),
+                if detail.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {detail}")
+                }
             ));
         }
     }
@@ -1067,6 +1147,9 @@ impl App {
 
     fn set_live_display(&mut self, enabled: bool) {
         self.live_display_enabled = enabled;
+        if !enabled {
+            self.pending_live_start = false;
+        }
         if self.device_preview_job.is_some() {
             return;
         }
@@ -1078,9 +1161,22 @@ impl App {
     }
 
     fn start_live_daemon(&mut self) -> bool {
+        if self.device_status_pending {
+            self.pending_live_start = true;
+            self.status_text =
+                "Waiting for device telemetry refresh before starting live display".into();
+            return false;
+        }
         let started = self.service_manager.start(&daemon_binary_path());
         self.daemon_running = started;
-        if !started {
+        self.device_status_live = false;
+        self.last_device_status_request = Instant::now() - Duration::from_secs(2);
+        self.refresh_sensors();
+        if started {
+            self.device_status_error = None;
+            self.status_text = "Live display daemon started; waiting for live telemetry".into();
+        } else {
+            self.live_display_enabled = false;
             self.last_error = Some("Live display daemon failed to start".into());
         }
         started
@@ -1089,6 +1185,10 @@ impl App {
     fn stop_live_daemon(&mut self) -> bool {
         let stopped = self.service_manager.stop();
         self.daemon_running = !stopped;
+        if stopped {
+            self.device_status_live = false;
+            self.refresh_sensors();
+        }
         if !stopped {
             self.last_error = Some(
                 "Live display daemon did not release ownership; device operation cancelled".into(),
@@ -1211,6 +1311,39 @@ impl App {
             .resizable(false)
             .show(ctx, |ui| {
                 ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    ui.label("Live Display");
+                    let running = self.daemon_running || self.pending_live_start;
+                    let label = if running { "Stop" } else { "Start" };
+                    let response = ui.add_enabled(
+                        self.device_preview_job.is_none() && !self.daemon_paused,
+                        egui::Button::new(label),
+                    );
+                    if response.clicked() {
+                        self.set_live_display(!running);
+                    }
+                    if self.daemon_paused {
+                        ui.label("Paused for device preview");
+                    } else if self.pending_live_start {
+                        ui.label("Starting…");
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Device preview");
+                    let label = if self.device_preview_enabled {
+                        "Turn off"
+                    } else {
+                        "Turn on"
+                    };
+                    if ui.button(label).clicked() {
+                        self.device_preview_enabled = !self.device_preview_enabled;
+                        self.preview_missing_reported = false;
+                    }
+                    if !matches!(self.page, Page::LiveDisplay | Page::StandbySettings) {
+                        ui.label("Idle on this page");
+                    }
+                });
+                ui.separator();
                 ui.heading("Display Preview");
                 ui.add_space(8.0);
                 self.update_preview_texture(ctx);
@@ -1789,12 +1922,12 @@ impl App {
             ]
         });
         if response.clicked_by(egui::PointerButton::Primary) {
-            self.selected_sensor =
-                pointer_canvas.and_then(|point| self.widget_at(point, 4.0 * 480.0 / rect.width()));
+            self.selected_sensor = pointer_canvas
+                .and_then(|point| self.widget_at(point, widget_hit_tolerance(rect.width())));
         }
         if response.drag_started_by(egui::PointerButton::Primary) {
             if let Some(point) = pointer_canvas {
-                if let Some(id) = self.widget_at(point, 4.0 * 480.0 / rect.width()) {
+                if let Some(id) = self.widget_at(point, widget_hit_tolerance(rect.width())) {
                     self.selected_sensor = Some(id.clone());
                     if let Some(instance) = self
                         .working
@@ -1970,23 +2103,7 @@ impl App {
     }
 
     fn widget_at(&self, point: [f32; 2], tolerance: f32) -> Option<String> {
-        self.working
-            .widget_instances
-            .iter()
-            .rev()
-            .filter(|instance| instance.visible && self.working.overlay_enabled)
-            .filter_map(|instance| {
-                let widget = self.working.resolved_widget(instance)?;
-                if !self.sensor_values.readings.contains_key(&widget.source_id)
-                    && !widget.style.show_missing
-                {
-                    return None;
-                }
-                self.renderer
-                    .widget_contains(&self.working, &instance.id, point, tolerance)
-                    .then(|| instance.id.clone())
-            })
-            .next()
+        widget_at_position(&self.working, &self.renderer, point, tolerance)
     }
 
     fn show_overview(&mut self, ui: &mut egui::Ui) {
@@ -2012,7 +2129,9 @@ impl App {
                     ui.label(self.device_info.revision.as_deref().unwrap_or("—"));
                     ui.end_row();
                     ui.label("Live Display");
-                    ui.label(if self.live_display_enabled {
+                    ui.label(if self.pending_live_start {
+                        "Starting after snapshot"
+                    } else if self.daemon_running {
                         "Enabled"
                     } else {
                         "Disabled"
@@ -2047,18 +2166,36 @@ impl App {
         ui.add_space(10.0);
         ui.group(|ui| {
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("Device metrics").strong());
+                ui.label(egui::RichText::new("Device telemetry").strong());
                 if ui
                     .add_enabled(
                         self.device_info.connected
                             && self.device_preview_job.is_none()
+                            && !self.daemon_paused
                             && !self.device_status_pending,
-                        egui::Button::new("Refresh"),
+                        egui::Button::new(if self.daemon_running {
+                            "Refresh live telemetry"
+                        } else {
+                            "Take one-time snapshot"
+                        }),
                     )
                     .clicked()
                 {
-                    self.start_device_status_refresh();
+                    self.start_device_status_refresh(true);
                 }
+            });
+            ui.label(if self.daemon_paused {
+                "The daemon is paused; live telemetry is unavailable until it resumes."
+            } else if self.daemon_running {
+                if self.device_status_live {
+                    "Live telemetry from the running daemon"
+                } else {
+                    "Waiting for live telemetry from the daemon"
+                }
+            } else if self.device_status_pending {
+                "Taking one-time snapshot; live telemetry requires the daemon."
+            } else {
+                "Live telemetry requires the daemon. Any readings below are snapshots, not live."
             });
             egui::Grid::new("overview-metrics")
                 .num_columns(2)
@@ -2066,7 +2203,7 @@ impl App {
                     ui.label("Coolant");
                     ui.label(
                         self.device_coolant
-                            .map(|v| format!("{v:.1} °C"))
+                            .map(|v| format!("{v:.2} °C"))
                             .unwrap_or_else(|| "—".to_string()),
                     );
                     ui.end_row();
@@ -2101,15 +2238,7 @@ impl App {
     }
 
     fn show_live_display(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.heading("Live Display");
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let mut enabled = self.live_display_enabled;
-                if ui.checkbox(&mut enabled, "Enabled").changed() {
-                    self.set_live_display(enabled);
-                }
-            });
-        });
+        ui.heading("Live Display");
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             ui.checkbox(&mut self.working.background.enabled, "Background");
@@ -2127,8 +2256,99 @@ impl App {
         }
     }
 
+    fn select_background_file(
+        &mut self,
+        path: PathBuf,
+        source: BackgroundSource,
+    ) -> Result<(), String> {
+        validate_media_file(&path, MediaDropTarget::LiveBackground)?;
+        let text = path.to_string_lossy().into_owned();
+        match source {
+            BackgroundSource::File => self.background_file_path = Some(text.clone()),
+            BackgroundSource::Stream => self.stream_path = Some(path),
+            BackgroundSource::SolidColor => unreachable!(),
+        }
+        self.background_source = source;
+        self.working.background.image_path = Some(text);
+        apply_background_preset_from_source(&mut self.working.background, TransformPreset::Cover)?;
+        self.preview_texture = None;
+        Ok(())
+    }
+
+    fn select_boot_file(&mut self, path: PathBuf) -> Result<(), String> {
+        validate_media_file(&path, MediaDropTarget::BootAnimation)?;
+        self.boot_path = Some(path.clone());
+        self.boot_default_preset = Some(PendingMediaPreset {
+            path: path.clone(),
+            transform_at_selection: self.boot_transform.transform,
+        });
+        self.boot_source_cache = None;
+        self.preview_texture = None;
+        self.start_boot_animation_decode(path);
+        Ok(())
+    }
+
+    fn select_standby_file(&mut self, path: PathBuf) -> Result<(), String> {
+        validate_media_file(&path, MediaDropTarget::StandbyMedia)?;
+        self.standby_path = Some(path.clone());
+        self.standby_default_preset = Some(PendingMediaPreset {
+            path,
+            transform_at_selection: self.standby_transform.transform,
+        });
+        self.standby_time = 0.0;
+        self.standby_duration = None;
+        self.standby_metadata_path = None;
+        self.standby_frame_key = None;
+        self.standby_frame_pending = false;
+        self.standby_source_cache = None;
+        self.preview_texture = None;
+        Ok(())
+    }
+
+    fn handle_dropped_media(&mut self, ctx: &egui::Context) {
+        let paths = ctx.input(|input| {
+            input
+                .raw
+                .dropped_files
+                .iter()
+                .map(|file| file.path.clone())
+                .collect::<Vec<_>>()
+        });
+        if paths.is_empty() {
+            return;
+        }
+        let Some(target) = media_drop_target(self.page, self.live_tab, self.standby_tab) else {
+            self.last_error =
+                Some("Open Live Background, Boot, or Standby before dropping a media file".into());
+            return;
+        };
+        if paths.len() != 1 {
+            self.last_error = Some("Drop exactly one media file at a time".into());
+            return;
+        }
+        let Some(path) = paths.into_iter().next().flatten() else {
+            self.last_error = Some("Dropped media must be a local file with a path".into());
+            return;
+        };
+        let result = match target {
+            MediaDropTarget::LiveBackground => {
+                self.select_background_file(path, BackgroundSource::File)
+            }
+            MediaDropTarget::BootAnimation => self.select_boot_file(path),
+            MediaDropTarget::StandbyMedia => self.select_standby_file(path),
+        };
+        if let Err(error) = result {
+            self.last_error = Some(error);
+        }
+    }
+
     fn show_background_editor(&mut self, ui: &mut egui::Ui) {
         ui.add_space(6.0);
+        ui.label(
+            egui::RichText::new("Drop a media file here to use it as the Live background.")
+                .small()
+                .color(egui::Color32::GRAY),
+        );
         let previous_source = self.background_source;
         egui::ComboBox::from_label("Source")
             .selected_text(self.background_source.label())
@@ -2163,19 +2383,10 @@ impl App {
                     ui.label(label);
                     if ui.button("Browse…").clicked() {
                         if let Some(path) = rfd::FileDialog::new().pick_file() {
-                            if image::open(&path).is_err()
-                                && Command::new("ffmpeg").arg("-version").output().is_err()
+                            if let Err(error) =
+                                self.select_background_file(path, BackgroundSource::File)
                             {
-                                self.last_error = Some("This media type requires FFmpeg. Install ffmpeg and try again.".to_string());
-                            } else {
-                                let path = path.to_string_lossy().into_owned();
-                                self.background_file_path = Some(path.clone());
-                                self.working.background.image_path = Some(path);
-                                apply_background_preset_from_source(
-                                    &mut self.working.background,
-                                    TransformPreset::Cover,
-                                )
-                                .unwrap_or_else(|error| self.last_error = Some(error));
+                                self.last_error = Some(error);
                             }
                         }
                     }
@@ -2187,19 +2398,10 @@ impl App {
                     ui.label(file_name(self.stream_path.as_ref()));
                     if ui.button("Browse…").clicked() {
                         if let Some(path) = rfd::FileDialog::new().pick_file() {
-                            if image::open(&path).is_err()
-                                && Command::new("ffmpeg").arg("-version").output().is_err()
+                            if let Err(error) =
+                                self.select_background_file(path, BackgroundSource::Stream)
                             {
-                                self.last_error = Some("This media type requires FFmpeg. Install ffmpeg and try again.".to_string());
-                            } else {
-                                self.stream_path = Some(path.clone());
-                                self.working.background.image_path =
-                                    Some(path.to_string_lossy().into_owned());
-                                apply_background_preset_from_source(
-                                    &mut self.working.background,
-                                    TransformPreset::Cover,
-                                )
-                                .unwrap_or_else(|error| self.last_error = Some(error));
+                                self.last_error = Some(error);
                             }
                         }
                     }
@@ -2614,21 +2816,20 @@ impl App {
                         .map(|value| renderer::format_value(&resolved.unit, value))
                         .unwrap_or_else(|| "--".to_string());
                     let representative = renderer::format_value(&resolved.unit, 100.0);
-                    let required = [current.as_str(), representative.as_str(), "--"]
-                        .into_iter()
-                        .filter_map(|value| self.renderer.widget_content_size(&resolved, value))
-                        .fold([0.0_f32, 0.0_f32], |size, item| {
-                            [size[0].max(item[0]), size[1].max(item[1])]
-                        });
-                    if ui.small_button("Fit to content").clicked() {
-                        instance.overrides.width = Some(required[0].ceil().clamp(1.0, 4096.0));
-                        instance.overrides.height = Some(required[1].ceil().clamp(1.0, 4096.0));
-                    }
-                    if required[0] > resolved.style.width || required[1] > resolved.style.height {
-                        ui.label(
-                            egui::RichText::new("Text may overflow the widget box")
-                                .color(egui::Color32::YELLOW),
-                        );
+                    if let Some(required) =
+                        self.renderer
+                            .widget_fit_size(&resolved, &current, &representative)
+                    {
+                        if ui.small_button("Fit to content").clicked() {
+                            instance.overrides.width = Some(required[0].ceil().clamp(1.0, 4096.0));
+                            instance.overrides.height = Some(required[1].ceil().clamp(1.0, 4096.0));
+                        }
+                        if self.renderer.widget_content_overflows(&resolved, required) {
+                            ui.label(
+                                egui::RichText::new("Text may overflow the widget box")
+                                    .color(egui::Color32::YELLOW),
+                            );
+                        }
                     }
                     override_text_row(ui, "Label", &resolved.label, &mut instance.overrides.label);
                     override_text_row(ui, "Unit", &resolved.unit, &mut instance.overrides.unit);
@@ -2902,13 +3103,6 @@ impl App {
         });
         ui.add_space(8.0);
 
-        if ui
-            .checkbox(&mut self.device_preview_enabled, "Show on device")
-            .changed()
-        {
-            self.preview_missing_reported = false;
-        }
-
         ui.separator();
         match self.standby_tab {
             StandbyTab::Boot => self.show_boot_settings(ui),
@@ -2918,6 +3112,11 @@ impl App {
 
     fn show_boot_settings(&mut self, ui: &mut egui::Ui) {
         ui.label(egui::RichText::new("Boot animation").strong());
+        ui.label(
+            egui::RichText::new("Drop one GIF here or choose a file.")
+                .small()
+                .color(egui::Color32::GRAY),
+        );
         ui.horizontal(|ui| {
             ui.label("File");
             ui.label(file_name(self.boot_path.as_ref()));
@@ -2926,14 +3125,9 @@ impl App {
                     .add_filter("GIF", &["gif"])
                     .pick_file()
                 {
-                    self.boot_path = Some(path.clone());
-                    self.boot_default_preset = Some(PendingMediaPreset {
-                        path: path.clone(),
-                        transform_at_selection: self.boot_transform.transform,
-                    });
-                    self.boot_source_cache = None;
-                    self.preview_texture = None;
-                    self.start_boot_animation_decode(path);
+                    if let Err(error) = self.select_boot_file(path) {
+                        self.last_error = Some(error);
+                    }
                 }
             }
         });
@@ -3111,23 +3305,19 @@ impl App {
 
     fn show_standby_media_settings(&mut self, ui: &mut egui::Ui) {
         ui.label(egui::RichText::new("Standby").strong());
+        ui.label(
+            egui::RichText::new("Drop one image or video here, or choose a file.")
+                .small()
+                .color(egui::Color32::GRAY),
+        );
         ui.horizontal(|ui| {
             ui.label("File");
             ui.label(file_name(self.standby_path.as_ref()));
             if ui.button("Browse…").clicked() {
                 if let Some(path) = rfd::FileDialog::new().pick_file() {
-                    self.standby_path = Some(path.clone());
-                    self.standby_default_preset = Some(PendingMediaPreset {
-                        path,
-                        transform_at_selection: self.standby_transform.transform,
-                    });
-                    self.standby_time = 0.0;
-                    self.standby_duration = None;
-                    self.standby_metadata_path = None;
-                    self.standby_frame_key = None;
-                    self.standby_frame_pending = false;
-                    self.standby_source_cache = None;
-                    self.preview_texture = None;
+                    if let Err(error) = self.select_standby_file(path) {
+                        self.last_error = Some(error);
+                    }
                 }
             }
         });
@@ -3156,6 +3346,53 @@ impl App {
         ) {
             self.last_error = Some(error);
         }
+        ui.separator();
+        ui.label(egui::RichText::new("Coolant temperature text on device").strong());
+        ui.label(egui::RichText::new("Current device visibility and color cannot be read. Keep unchanged unless you choose a new value. The streamed preview does not show the device's text overlay.").small().color(egui::Color32::GRAY));
+        egui::ComboBox::from_label("Text visibility")
+            .selected_text(match self.standby_overlay {
+                None => "Keep unchanged",
+                Some(true) => "Show",
+                Some(false) => "Hide",
+            })
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut self.standby_overlay, None, "Keep unchanged");
+                ui.selectable_value(&mut self.standby_overlay, Some(true), "Show");
+                ui.selectable_value(&mut self.standby_overlay, Some(false), "Hide");
+            });
+        if ui
+            .add_enabled(
+                self.standby_overlay.is_some()
+                    && self.device_info.connected
+                    && self.device_preview_job.is_none()
+                    && !self.daemon_paused,
+                egui::Button::new("Apply text visibility now"),
+            )
+            .clicked()
+        {
+            self.run_short_device_command(
+                "Set coolant text visibility",
+                standby_visibility_args(self.standby_overlay.unwrap()),
+            );
+        }
+        let mut set_color = self.standby_text_color.is_some();
+        if ui
+            .checkbox(&mut set_color, "Set text color on next upload")
+            .changed()
+        {
+            self.standby_text_color = set_color.then_some([255, 255, 255]);
+        }
+        if let Some(color) = &mut self.standby_text_color {
+            ui.horizontal(|ui| {
+                ui.label("Text color");
+                rgb_editor(ui, "standby-device-text-color", color);
+            });
+        }
+        ui.label(
+            egui::RichText::new("Text color is committed only when a standby image is uploaded.")
+                .small()
+                .color(egui::Color32::GRAY),
+        );
         let standby_frame_ready = self.standby_path.as_ref().is_some_and(|path| {
             self.standby_source_cache
                 .as_ref()
@@ -3165,7 +3402,10 @@ impl App {
         });
         if ui
             .add_enabled(
-                self.device_info.connected && standby_frame_ready,
+                self.device_info.connected
+                    && standby_frame_ready
+                    && self.device_preview_job.is_none()
+                    && !self.daemon_paused,
                 egui::Button::new("Upload persistent standby image"),
             )
             .clicked()
@@ -3185,9 +3425,13 @@ impl App {
                 .unwrap()
                 .to_string_lossy()
                 .into_owned();
-            let mut args = vec!["--upload-standby".into(), path];
-            args.extend(media_transform_args(&self.standby_transform));
-            args.extend(["--media-time".into(), self.standby_time.to_string()]);
+            let args = standby_upload_args(
+                &path,
+                &self.standby_transform,
+                self.standby_time,
+                self.standby_text_color,
+                self.standby_overlay,
+            );
             self.run_short_device_command("Upload standby image", args);
         }
     }
@@ -3367,6 +3611,8 @@ impl App {
     fn show_settings(&mut self, ui: &mut egui::Ui) {
         ui.heading("Settings");
         ui.add_space(8.0);
+        ui.collapsing("Profiles", |ui| self.show_profiles(ui));
+        ui.add_space(8.0);
         ui.group(|ui| {
             ui.label(egui::RichText::new("Device").strong());
             egui::ComboBox::from_label("Orientation")
@@ -3430,7 +3676,6 @@ impl App {
     }
 
     fn show_profiles(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Profiles");
         ui.label("Profiles store runtime display configuration; Boot and Standby uploads remain separate.");
         let names = match self.profiles.list() {
             Ok(names) => names,
@@ -3624,7 +3869,7 @@ impl App {
             self.is_dirty()
         ));
         if let Some(value) = self.device_coolant {
-            output.push_str(&format!("device.coolant_c={value:.1}\n"));
+            output.push_str(&format!("device.coolant_c={value:.2}\n"));
         }
         if let Some(value) = self.device_pump_rpm {
             output.push_str(&format!("device.pump_rpm={value}\n"));
@@ -3666,25 +3911,42 @@ impl App {
             }
             if ui
                 .add_enabled(
-                    self.device_info.connected && !self.device_status_pending,
-                    egui::Button::new("Refresh device telemetry"),
+                    self.device_info.connected
+                        && self.device_preview_job.is_none()
+                        && !self.daemon_paused
+                        && !self.device_status_pending,
+                    egui::Button::new(if self.daemon_running {
+                        "Refresh live telemetry"
+                    } else {
+                        "Take one-time device snapshot"
+                    }),
                 )
                 .clicked()
             {
-                self.start_device_status_refresh();
+                self.start_device_status_refresh(true);
             }
+        });
+        ui.label(if self.daemon_paused {
+            "The daemon is paused; live telemetry is unavailable until it resumes."
+        } else if self.daemon_running {
+            "Live telemetry comes from the running daemon."
+        } else {
+            "Live telemetry is unavailable while the daemon is stopped; snapshots are manual."
         });
     }
 
-    fn start_device_status_refresh(&mut self) {
+    fn start_device_status_refresh(&mut self, allow_offline_snapshot: bool) {
         if self.device_status_pending {
+            return;
+        }
+        if !allow_offline_snapshot && (!self.daemon_running || self.daemon_paused) {
             return;
         }
         self.device_status_pending = true;
         self.last_device_status_request = Instant::now();
         let tx = self.device_status_tx.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(query_device_telemetry());
+            let _ = tx.send(query_device_telemetry(allow_offline_snapshot));
         });
     }
 
@@ -3717,10 +3979,13 @@ impl App {
     }
 
     fn device_preview_spec(&self, mode: DevicePreviewMode, path: &Path) -> DevicePreviewSpec {
+        if mode == DevicePreviewMode::LiveDisplay {
+            return build_live_preview_spec(path, self.brightness);
+        }
         let transform = match mode {
             DevicePreviewMode::BootLoop => &self.boot_transform,
             DevicePreviewMode::Standby => &self.standby_transform,
-            DevicePreviewMode::Off => unreachable!(),
+            DevicePreviewMode::Off | DevicePreviewMode::LiveDisplay => unreachable!(),
         };
         build_device_preview_spec(
             mode,
@@ -3736,8 +4001,43 @@ impl App {
         )
     }
 
+    fn write_live_preview_snapshot(&mut self) -> Result<PathBuf, String> {
+        let snapshot = live_preview_config(
+            &self.working,
+            self.background_source,
+            self.background_file_path.as_deref(),
+            self.stream_path.as_deref(),
+        );
+        if self.live_preview_dir.is_none() {
+            self.live_preview_dir = Some(
+                tempfile::Builder::new()
+                    .prefix("th420-gui-live-preview-")
+                    .tempdir()
+                    .map_err(|error| format!("Cannot create Live preview snapshot: {error}"))?,
+            );
+        }
+        let dir = self.live_preview_dir.as_ref().unwrap();
+        let path = dir.path().join("config.toml");
+        if self.last_live_preview_config.as_ref() != Some(&snapshot) {
+            write_live_preview_config(&path, &snapshot)?;
+            self.last_live_preview_config = Some(snapshot);
+        }
+        Ok(path)
+    }
+
     fn reconcile_device_preview(&mut self) {
         let desired = self.desired_device_preview_mode();
+        if desired != DevicePreviewMode::LiveDisplay && self.live_preview_dir.is_some() {
+            if self
+                .device_preview_job
+                .as_ref()
+                .is_some_and(|job| job.spec.mode == DevicePreviewMode::LiveDisplay)
+            {
+                self.stop_device_preview_child();
+            }
+            self.live_preview_dir = None;
+            self.last_live_preview_config = None;
+        }
         if desired == DevicePreviewMode::Off {
             self.pending_device_preview_spec = None;
             self.device_preview_refresh_now = false;
@@ -3746,6 +4046,16 @@ impl App {
             return;
         }
         let path = match desired {
+            DevicePreviewMode::LiveDisplay => match self.write_live_preview_snapshot() {
+                Ok(path) => Some(path),
+                Err(error) => {
+                    self.last_error = Some(error);
+                    self.device_preview_enabled = false;
+                    self.stop_device_preview_child();
+                    self.resume_preview_daemon();
+                    return;
+                }
+            },
             DevicePreviewMode::BootLoop => self.boot_path.clone(),
             DevicePreviewMode::Standby => self.standby_path.clone(),
             DevicePreviewMode::Off => None,
@@ -3763,27 +4073,30 @@ impl App {
         self.preview_missing_reported = false;
 
         let sources = match desired {
+            DevicePreviewMode::LiveDisplay => Vec::new(),
             DevicePreviewMode::BootLoop => self.boot_source_dimensions_all(),
             DevicePreviewMode::Standby => self.standby_source_dimensions().into_iter().collect(),
             DevicePreviewMode::Off => Vec::new(),
         };
-        if sources.is_empty() {
+        if desired != DevicePreviewMode::LiveDisplay && sources.is_empty() {
             self.stop_device_preview_child();
             self.resume_preview_daemon();
             return;
         }
-        let (media, snap) = match desired {
-            DevicePreviewMode::BootLoop => (&self.boot_transform, self.boot_snap),
-            DevicePreviewMode::Standby => (&self.standby_transform, self.standby_snap),
-            DevicePreviewMode::Off => unreachable!(),
-        };
-        if let Some(error) =
-            media_placement_error_many(&sources, &media.fit, &media.transform, snap)
-        {
-            self.last_error = Some(format!("Device preview placement is invalid: {error}"));
-            self.stop_device_preview_child();
-            self.resume_preview_daemon();
-            return;
+        if desired != DevicePreviewMode::LiveDisplay {
+            let (media, snap) = match desired {
+                DevicePreviewMode::BootLoop => (&self.boot_transform, self.boot_snap),
+                DevicePreviewMode::Standby => (&self.standby_transform, self.standby_snap),
+                DevicePreviewMode::Off | DevicePreviewMode::LiveDisplay => unreachable!(),
+            };
+            if let Some(error) =
+                media_placement_error_many(&sources, &media.fit, &media.transform, snap)
+            {
+                self.last_error = Some(format!("Device preview placement is invalid: {error}"));
+                self.stop_device_preview_child();
+                self.resume_preview_daemon();
+                return;
+            }
         }
 
         let spec = self.device_preview_spec(desired, &path);
@@ -3844,10 +4157,29 @@ impl App {
             }
         }
 
+        let stderr = if desired == DevicePreviewMode::LiveDisplay {
+            let log_path = self
+                .live_preview_dir
+                .as_ref()
+                .unwrap()
+                .path()
+                .join("stderr.log");
+            match File::create(&log_path) {
+                Ok(file) => Stdio::from(file),
+                Err(error) => {
+                    self.last_error = Some(format!("Cannot capture Live preview errors: {error}"));
+                    self.device_preview_enabled = false;
+                    self.resume_preview_daemon();
+                    return;
+                }
+            }
+        } else {
+            Stdio::null()
+        };
         match Command::new(daemon_binary_path())
             .args(&spec.args)
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(stderr)
             .spawn()
         {
             Ok(child) => {
@@ -3869,6 +4201,8 @@ impl App {
         self.stop_device_preview_child();
         self.resume_preview_daemon();
         self.device_preview_mode = DevicePreviewMode::Off;
+        self.live_preview_dir = None;
+        self.last_live_preview_config = None;
     }
 
     fn stop_device_preview_child(&mut self) {
@@ -3902,17 +4236,59 @@ impl App {
     }
 }
 
+fn live_preview_config(
+    working: &Config,
+    source: BackgroundSource,
+    file_path: Option<&str>,
+    stream_path: Option<&Path>,
+) -> Config {
+    let mut snapshot = working.clone();
+    snapshot.background.image_path = match source {
+        BackgroundSource::File => file_path.map(str::to_string),
+        BackgroundSource::Stream => stream_path.map(|path| path.to_string_lossy().into_owned()),
+        BackgroundSource::SolidColor => None,
+    };
+    snapshot
+}
+
+fn write_live_preview_config(path: &Path, snapshot: &Config) -> Result<(), String> {
+    let pending = path.with_file_name("config-next.toml");
+    let text = toml::to_string_pretty(snapshot)
+        .map_err(|error| format!("Cannot serialize Live preview: {error}"))?;
+    std::fs::write(&pending, text)
+        .and_then(|()| std::fs::rename(&pending, path))
+        .map_err(|error| format!("Cannot update Live preview snapshot: {error}"))
+}
+
+fn build_live_preview_spec(path: &Path, brightness: u8) -> DevicePreviewSpec {
+    DevicePreviewSpec {
+        mode: DevicePreviewMode::LiveDisplay,
+        source_path: path.to_path_buf(),
+        args: vec![
+            "--preview-live".into(),
+            "--config".into(),
+            path.to_string_lossy().into_owned(),
+            "--live-brightness".into(),
+            brightness.to_string(),
+        ],
+    }
+}
+
 fn desired_device_preview_mode_for(
     enabled: bool,
     page: Page,
     standby_tab: StandbyTab,
 ) -> DevicePreviewMode {
-    if !enabled || page != Page::StandbySettings {
+    if !enabled {
         return DevicePreviewMode::Off;
     }
-    match standby_tab {
-        StandbyTab::Boot => DevicePreviewMode::BootLoop,
-        StandbyTab::Standby => DevicePreviewMode::Standby,
+    match page {
+        Page::LiveDisplay => DevicePreviewMode::LiveDisplay,
+        Page::StandbySettings => match standby_tab {
+            StandbyTab::Boot => DevicePreviewMode::BootLoop,
+            StandbyTab::Standby => DevicePreviewMode::Standby,
+        },
+        Page::Overview | Page::Diagnostics | Page::Settings => DevicePreviewMode::Off,
     }
 }
 
@@ -4075,6 +4451,7 @@ impl eframe::App for App {
         self.show_top_bar(ctx);
         self.show_brightness_bar(ctx);
         self.show_sidebar(ctx);
+        self.handle_dropped_media(ctx);
         self.show_preview_panel(ctx);
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -4084,7 +4461,6 @@ impl eframe::App for App {
                     Page::Overview => self.show_overview(ui),
                     Page::LiveDisplay => self.show_live_display(ui),
                     Page::StandbySettings => self.show_standby_settings(ui),
-                    Page::Profiles => self.show_profiles(ui),
                     Page::Diagnostics => self.show_diagnostics(ui),
                     Page::Settings => self.show_settings(ui),
                 }
@@ -4130,16 +4506,33 @@ fn snap(value: f32, grid: f32) -> f32 {
     }
 }
 
-fn query_device_telemetry() -> Result<DeviceTelemetry, String> {
+fn live_telemetry_poll_due(
+    daemon_running: bool,
+    daemon_paused: bool,
+    preview_active: bool,
+    pending: bool,
+    since_last_request: Duration,
+) -> bool {
+    daemon_running
+        && !daemon_paused
+        && !preview_active
+        && !pending
+        && since_last_request >= Duration::from_secs(1)
+}
+
+fn query_device_telemetry(allow_offline_snapshot: bool) -> Result<(DeviceTelemetry, bool), String> {
     if let Some(owner) = current_owner(InstanceKind::Daemon) {
         let response = request_daemon_command(&owner, "telemetry", Duration::from_secs(1))?;
-        return parse_device_telemetry(&response);
+        return parse_device_telemetry(&response).map(|telemetry| (telemetry, true));
     }
 
-    let output = Command::new(daemon_binary_path())
-        .arg("--status")
-        .output()
-        .map_err(|error| format!("Failed to read device status: {error}"))?;
+    if !allow_offline_snapshot {
+        return Err("Live telemetry requires a running daemon".into());
+    }
+
+    let output =
+        bounded_command_output(&daemon_binary_path(), &["--status"], Duration::from_secs(3))
+            .map_err(|error| format!("Failed to read device snapshot: {error}"))?;
     if !output.status.success() {
         let error = String::from_utf8_lossy(&output.stderr).trim().to_string();
         return Err(if error.is_empty() {
@@ -4149,6 +4542,39 @@ fn query_device_telemetry() -> Result<DeviceTelemetry, String> {
         });
     }
     parse_device_telemetry(&String::from_utf8_lossy(&output.stdout))
+        .map(|telemetry| (telemetry, false))
+}
+
+fn bounded_command_output(
+    program: &Path,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<std::process::Output, String> {
+    let mut child = Command::new(program)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| error.to_string())?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return child.wait_with_output().map_err(|error| error.to_string()),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(25)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "status helper exceeded the {timeout:?} timeout and was stopped"
+                ));
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error.to_string());
+            }
+        }
+    }
 }
 
 fn parse_device_telemetry(text: &str) -> Result<DeviceTelemetry, String> {
@@ -4196,6 +4622,37 @@ fn paint_centered_grid(ui: &egui::Ui, rect: egui::Rect, grid: f32) {
             stroke,
         );
     }
+}
+
+fn widget_hit_tolerance(preview_width: f32) -> f32 {
+    if preview_width > 0.0 {
+        4.0 * 480.0 / preview_width
+    } else {
+        0.0
+    }
+}
+
+fn widget_at_position(
+    config: &Config,
+    renderer: &Renderer,
+    point: [f32; 2],
+    tolerance: f32,
+) -> Option<String> {
+    if !config.overlay_enabled {
+        return None;
+    }
+    config
+        .widget_instances
+        .iter()
+        .rev()
+        .filter(|instance| instance.visible)
+        .filter_map(|instance| {
+            config.resolved_widget(instance)?;
+            renderer
+                .widget_contains(config, &instance.id, point, tolerance)
+                .then(|| instance.id.clone())
+        })
+        .next()
 }
 
 fn constrained_media_pan(
@@ -4415,29 +4872,50 @@ struct ColorDraft {
     dirty: bool,
 }
 
+impl ColorDraft {
+    fn new(color: [u8; 3]) -> Self {
+        Self {
+            source: color,
+            text: format_rgb_hex(color),
+            dirty: false,
+        }
+    }
+
+    fn sync(&mut self, color: [u8; 3]) {
+        if !self.dirty && self.source != color {
+            *self = Self::new(color);
+        }
+    }
+
+    fn commit(&mut self, color: &mut [u8; 3]) -> bool {
+        let Some(parsed) = parse_rgb_hex(&self.text) else {
+            return false;
+        };
+        let changed = parsed != *color;
+        *color = parsed;
+        *self = Self::new(parsed);
+        changed
+    }
+}
+
+fn format_rgb_hex(color: [u8; 3]) -> String {
+    format!("#{:02X}{:02X}{:02X}", color[0], color[1], color[2])
+}
+
 fn rgb_editor(ui: &mut egui::Ui, key: impl std::hash::Hash, color: &mut [u8; 3]) -> bool {
     let id = ui.id().with(key);
     let mut state = ui
         .ctx()
         .data_mut(|data| data.get_temp::<ColorDraft>(id))
-        .unwrap_or_else(|| ColorDraft {
-            source: *color,
-            text: format!("#{:02X}{:02X}{:02X}", color[0], color[1], color[2]),
-            dirty: false,
-        });
-    if !state.dirty && state.source != *color {
-        state.source = *color;
-        state.text = format!("#{:02X}{:02X}{:02X}", color[0], color[1], color[2]);
-    }
+        .unwrap_or_else(|| ColorDraft::new(*color));
+    state.sync(*color);
     let mut changed = false;
     let mut picker = color.map(|channel| channel as f32 / 255.0);
     ui.scope(|ui| {
         ui.spacing_mut().interact_size.y = 28.0;
         if egui::color_picker::color_edit_button_rgb(ui, &mut picker).changed() {
             *color = picker.map(|channel| (channel * 255.0).round().clamp(0.0, 255.0) as u8);
-            state.source = *color;
-            state.text = format!("#{:02X}{:02X}{:02X}", color[0], color[1], color[2]);
-            state.dirty = false;
+            state = ColorDraft::new(*color);
             changed = true;
         }
         let response = ui.add(egui::TextEdit::singleline(&mut state.text).desired_width(78.0));
@@ -4445,13 +4923,7 @@ fn rgb_editor(ui: &mut egui::Ui, key: impl std::hash::Hash, color: &mut [u8; 3])
         if response.lost_focus()
             || (response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)))
         {
-            if let Some(parsed) = parse_rgb_hex(&state.text) {
-                changed |= parsed != *color;
-                *color = parsed;
-                state.source = parsed;
-                state.text = format!("#{:02X}{:02X}{:02X}", color[0], color[1], color[2]);
-                state.dirty = false;
-            }
+            changed |= state.commit(color);
         }
         if state.dirty && parse_rgb_hex(&state.text).is_none() {
             response.on_hover_text("Enter a color as #RRGGBB");
@@ -4467,13 +4939,21 @@ fn rgb_editor(ui: &mut egui::Ui, key: impl std::hash::Hash, color: &mut [u8; 3])
 }
 
 fn background_transparency_slider(ui: &mut egui::Ui, opacity: &mut u8) {
-    let mut transparency = 100 - (u16::from(*opacity) * 100 / 255) as u8;
+    let mut transparency = opacity_to_transparency(*opacity);
     if ui
         .add(egui::Slider::new(&mut transparency, 0..=100).text("Transparency"))
         .changed()
     {
-        *opacity = (((100 - transparency) as u16 * 255 + 50) / 100) as u8;
+        *opacity = transparency_to_opacity(transparency);
     }
+}
+
+fn opacity_to_transparency(opacity: u8) -> u8 {
+    100 - (u16::from(opacity) * 100 / 255) as u8
+}
+
+fn transparency_to_opacity(transparency: u8) -> u8 {
+    (((100 - transparency.min(100)) as u16 * 255 + 50) / 100) as u8
 }
 
 fn override_background_transparency_row(
@@ -4488,7 +4968,7 @@ fn override_background_transparency_row(
                 *override_opacity = None;
             }
         } else {
-            let transparency = 100 - (u16::from(inherited_opacity) * 100 / 255) as u8;
+            let transparency = opacity_to_transparency(inherited_opacity);
             ui.label(format!("Transparency: {transparency}% (template)"));
             if ui.small_button("Override").clicked() {
                 *override_opacity = Some(inherited_opacity);
@@ -4534,11 +5014,19 @@ fn color_map_editor(ui: &mut egui::Ui, map: &mut Vec<config::ColorPoint>, owner_
         });
         row_ids.push(next_id);
     }
-    let mut rows: Vec<_> = std::mem::take(map).into_iter().zip(row_ids).collect();
-    rows.sort_by(|left, right| left.0.value.total_cmp(&right.0.value));
-    let (points, row_ids): (Vec<_>, Vec<_>) = rows.into_iter().unzip();
-    *map = points;
+    sort_threshold_rows(map, &mut row_ids);
     ui.ctx().data_mut(|data| data.insert_temp(ids_key, row_ids));
+}
+
+fn sort_threshold_rows(map: &mut Vec<config::ColorPoint>, row_ids: &mut Vec<u64>) {
+    let mut rows: Vec<_> = std::mem::take(map)
+        .into_iter()
+        .zip(std::mem::take(row_ids))
+        .collect();
+    rows.sort_by(|left, right| left.0.value.total_cmp(&right.0.value));
+    let (points, ids): (Vec<_>, Vec<_>) = rows.into_iter().unzip();
+    *map = points;
+    *row_ids = ids;
 }
 
 #[cfg(test)]
@@ -4548,9 +5036,179 @@ mod transform_drag_tests {
     #[test]
     fn rgb_hex_requires_complete_hash_prefixed_color() {
         assert_eq!(parse_rgb_hex("#aBcD09"), Some([0xab, 0xcd, 0x09]));
+        assert_eq!(format_rgb_hex([0xab, 0xcd, 0x09]), "#ABCD09");
         for invalid in ["abcd09", "#abcd", "#abcd0x", "#abcd0900"] {
             assert_eq!(parse_rgb_hex(invalid), None);
         }
+    }
+
+    #[test]
+    fn color_drafts_commit_only_complete_hex_and_keep_independent_values() {
+        let mut first = [1, 2, 3];
+        let mut second = [4, 5, 6];
+        let mut first_draft = ColorDraft::new(first);
+        let mut second_draft = ColorDraft::new(second);
+        first_draft.text = "#AA".into();
+        first_draft.dirty = true;
+        assert!(!first_draft.commit(&mut first));
+        first_draft.sync([9, 9, 9]);
+        assert_eq!(first_draft.text, "#AA");
+        assert_eq!(first, [1, 2, 3]);
+        first_draft.text = "#AABBCC".into();
+        assert!(first_draft.commit(&mut first));
+        assert_eq!(first, [0xaa, 0xbb, 0xcc]);
+        assert_eq!(second_draft.text, "#040506");
+        assert!(!second_draft.commit(&mut second));
+        assert_eq!(second, [4, 5, 6]);
+        second_draft.sync([7, 8, 9]);
+        assert_eq!(second_draft.text, "#070809");
+    }
+
+    #[test]
+    fn transparency_conversion_preserves_endpoints_and_nearby_roundtrips() {
+        assert_eq!(transparency_to_opacity(0), 255);
+        assert_eq!(transparency_to_opacity(100), 0);
+        assert_eq!(opacity_to_transparency(255), 0);
+        assert_eq!(opacity_to_transparency(0), 100);
+        for transparency in 0..=100 {
+            let roundtrip = opacity_to_transparency(transparency_to_opacity(transparency));
+            assert!((i16::from(roundtrip) - i16::from(transparency)).abs() <= 1);
+        }
+    }
+
+    #[test]
+    fn color_overrides_survive_config_roundtrip_without_affecting_siblings() {
+        let mut config = Config::default();
+        let mut sibling = config.widget_instances[0].clone();
+        sibling.id = "color-sibling".into();
+        config.widget_instances.push(sibling);
+        config.widget_instances[0].overrides.label_color = Some([12, 34, 56]);
+        config.widget_instances[0].overrides.background_color = Some([23, 45, 67]);
+        config.widget_instances[0].overrides.background_opacity = Some(128);
+        let encoded = toml::to_string(&config).unwrap();
+        let decoded: Config = toml::from_str(&encoded).unwrap();
+        let first = decoded
+            .resolved_widget(&decoded.widget_instances[0])
+            .unwrap();
+        let second = decoded
+            .resolved_widget(&decoded.widget_instances[1])
+            .unwrap();
+        assert_eq!(first.style.label_color, [12, 34, 56]);
+        assert_eq!(first.style.background_color, [23, 45, 67]);
+        assert_eq!(first.style.background_opacity, 128);
+        assert_eq!(
+            second.style.label_color,
+            decoded.widget_templates[0].style.label_color
+        );
+        assert_eq!(
+            second.style.background_color,
+            decoded.widget_templates[0].style.background_color
+        );
+    }
+
+    #[test]
+    fn threshold_reordering_preserves_each_rows_color_and_draft_identity() {
+        let mut points = vec![
+            config::ColorPoint {
+                value: 80.0,
+                color: [255, 0, 0],
+            },
+            config::ColorPoint {
+                value: 20.0,
+                color: [0, 255, 0],
+            },
+        ];
+        let mut ids = vec![11, 22];
+        sort_threshold_rows(&mut points, &mut ids);
+        assert_eq!(ids, [22, 11]);
+        assert_eq!(points[0].color, [0, 255, 0]);
+        assert_eq!(points[1].color, [255, 0, 0]);
+    }
+
+    #[test]
+    fn widget_selection_uses_rotated_geometry_topmost_order_and_visibility() {
+        let mut config = Config::default();
+        config.widget_instances.truncate(1);
+        config.widget_instances[0].transform.pan_x = 0.5;
+        config.widget_instances[0].transform.pan_y = -0.5;
+        let lower_id = config.widget_instances[0].id.clone();
+        let mut upper = config.widget_instances[0].clone();
+        upper.id = "upper".into();
+        config.widget_instances.push(upper);
+        let renderer = Renderer::new();
+        for rotation in [0.0, 90.0, 180.0] {
+            config.widget_instances[0].transform.rotation = rotation;
+            config.widget_instances[1].transform.rotation = rotation;
+            assert_eq!(
+                widget_at_position(&config, &renderer, [0.5, -0.5], 0.0),
+                Some("upper".into())
+            );
+        }
+        config.widget_instances[1].visible = false;
+        assert_eq!(
+            widget_at_position(&config, &renderer, [0.5, -0.5], 0.0),
+            Some(lower_id)
+        );
+        config.overlay_enabled = false;
+        assert_eq!(
+            widget_at_position(&config, &renderer, [0.5, -0.5], 0.0),
+            None
+        );
+    }
+
+    #[test]
+    fn coolant_placeholder_remains_selectable_without_daemon_telemetry() {
+        let mut config = Config::default();
+        config
+            .widget_instances
+            .retain(|instance| instance.source_id == "coolant");
+        assert_eq!(config.widget_instances.len(), 1);
+        let id = config.widget_instances[0].id.clone();
+        let point = [
+            config.widget_instances[0].transform.pan_x,
+            config.widget_instances[0].transform.pan_y,
+        ];
+        assert_eq!(
+            widget_at_position(&config, &Renderer::new(), point, 0.0),
+            Some(id)
+        );
+    }
+
+    #[test]
+    fn widget_pointer_tolerance_scales_with_preview_and_drag_keeps_selection() {
+        let mut config = Config::default();
+        config.widget_instances.truncate(1);
+        config.widget_instances[0].transform.pan_x = 0.0;
+        config.widget_instances[0].transform.pan_y = 0.0;
+        config.widget_instances[0].transform.rotation = 0.0;
+        let widget = config.resolved_widget(&config.widget_instances[0]).unwrap();
+        let edge = widget.style.width / 2.0;
+        let renderer = Renderer::new();
+        for preview_width in [240.0, 480.0, 960.0] {
+            let tolerance = widget_hit_tolerance(preview_width);
+            assert_eq!((tolerance * preview_width / 480.0).round(), 4.0);
+            assert!(widget_at_position(
+                &config,
+                &renderer,
+                [edge + tolerance - 0.1, 0.0],
+                tolerance
+            )
+            .is_some());
+            assert!(widget_at_position(
+                &config,
+                &renderer,
+                [edge + tolerance + 0.1, 0.0],
+                tolerance
+            )
+            .is_none());
+        }
+        let selected = widget_at_position(&config, &renderer, [0.0, 0.0], 0.0).unwrap();
+        let mut drag = DragSnapState::new([0.0, 0.0]);
+        drag.update([400.0, 0.0], false, 8.0);
+        config.widget_instances[0].transform.pan_x = drag.raw[0];
+        assert_eq!(selected, config.widget_instances[0].id);
+        assert!(widget_at_position(&config, &renderer, [0.0, 0.0], 0.0).is_none());
+        assert_eq!(drag.finish(false, 8.0), [400.0, 0.0]);
     }
 
     #[test]
@@ -4615,14 +5273,135 @@ mod transform_drag_tests {
     }
 
     #[test]
+    fn media_placement_intersects_animation_frames_and_rejects_impossible_coverage() {
+        let sources = [(480, 480), (300, 300)];
+        let mut transform = Transform2D::default();
+        let snap = SnapSettings {
+            enabled: false,
+            ..SnapSettings::default()
+        };
+        assert_eq!(
+            constrained_media_pan_many(
+                &sources,
+                &ImageFit::Native,
+                &transform,
+                [391.0, 0.0],
+                snap,
+                false
+            )
+            .unwrap(),
+            [390.0, 0.0]
+        );
+        transform.pan_x = 390.0;
+        assert!(
+            media_placement_error_many(&sources, &ImageFit::Native, &transform, snap).is_none()
+        );
+        transform.pan_x = 391.0;
+        assert!(
+            media_placement_error_many(&sources, &ImageFit::Native, &transform, snap).is_some()
+        );
+        let strict = SnapSettings {
+            keep_covered: true,
+            ..snap
+        };
+        transform.pan_x = 0.0;
+        assert!(
+            media_placement_error_many(&sources, &ImageFit::Native, &transform, strict)
+                .unwrap()
+                .contains("increase zoom or stretch")
+        );
+        transform.zoom = 2.0;
+        assert!(
+            media_placement_error_many(&sources, &ImageFit::Native, &transform, strict).is_none()
+        );
+    }
+
+    #[test]
+    fn preview_and_upload_use_identical_media_transform_arguments() {
+        let media = MediaTransform {
+            fit: ImageFit::Native,
+            transform: Transform2D {
+                pan_x: -11.5,
+                pan_y: 22.25,
+                zoom: 1.4,
+                stretch_x: 1.2,
+                stretch_y: 0.8,
+                rotation: -31.0,
+            },
+            canvas_color: [12, 34, 56],
+        };
+        let shared = media_transform_args(&media);
+        let boot_preview = build_device_preview_spec(
+            DevicePreviewMode::BootLoop,
+            Path::new("boot.gif"),
+            50,
+            &media,
+            Some((1, 3, 100)),
+            None,
+        );
+        let standby_preview = build_device_preview_spec(
+            DevicePreviewMode::Standby,
+            Path::new("standby.png"),
+            50,
+            &media,
+            None,
+            Some(2.5),
+        );
+        for preview in [boot_preview, standby_preview] {
+            assert!(preview
+                .args
+                .windows(shared.len())
+                .any(|window| window == shared));
+        }
+        let mut upload = vec!["--upload-boot".to_string(), "boot.gif".to_string()];
+        upload.extend(media_transform_args(&media));
+        assert_eq!(&upload[2..], shared.as_slice());
+    }
+
+    #[test]
     fn parses_daemon_and_direct_device_telemetry() {
         let telemetry =
-            parse_device_telemetry("coolant_temp_c=28.5\npump_rpm=2320\nage_ms=17\n").unwrap();
-        assert_eq!(telemetry.coolant_temp_c, 28.5);
+            parse_device_telemetry("coolant_temp_c=30.97\npump_rpm=2320\nage_ms=17\n").unwrap();
+        assert_eq!(telemetry.coolant_temp_c, 30.97);
         assert_eq!(telemetry.pump_rpm, 2320);
         assert_eq!(telemetry.age_ms, 17);
 
         assert!(parse_device_telemetry("pump_rpm=2320\n").is_err());
+    }
+
+    #[test]
+    fn automatic_telemetry_never_starts_an_offline_status_probe() {
+        let due = Duration::from_secs(5);
+        assert!(!live_telemetry_poll_due(false, false, false, false, due));
+        assert!(!live_telemetry_poll_due(true, true, false, false, due));
+        assert!(!live_telemetry_poll_due(true, false, true, false, due));
+        assert!(!live_telemetry_poll_due(true, false, false, true, due));
+        assert!(!live_telemetry_poll_due(
+            true,
+            false,
+            false,
+            false,
+            Duration::from_millis(999)
+        ));
+        assert!(live_telemetry_poll_due(
+            true,
+            false,
+            false,
+            false,
+            Duration::from_secs(1)
+        ));
+    }
+
+    #[test]
+    fn offline_snapshot_helper_has_a_bounded_lifetime() {
+        let started = Instant::now();
+        let error = bounded_command_output(Path::new("sleep"), &["2"], Duration::from_millis(50))
+            .unwrap_err();
+        assert!(error.contains("timeout"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let output =
+            bounded_command_output(Path::new("true"), &[], Duration::from_secs(1)).unwrap();
+        assert!(output.status.success());
     }
 
     #[test]
@@ -4862,9 +5641,11 @@ mod transform_drag_tests {
 #[cfg(test)]
 mod device_preview_mode_tests {
     use super::{
-        build_device_preview_spec, desired_device_preview_mode_for, DevicePreviewMode,
+        build_device_preview_spec, build_live_preview_spec, desired_device_preview_mode_for,
+        live_preview_config, write_live_preview_config, BackgroundSource, DevicePreviewMode,
         MediaTransform, Page, StandbyTab,
     };
+    use crate::config::Config;
     use std::path::Path;
 
     #[test]
@@ -4887,13 +5668,11 @@ mod device_preview_mode_tests {
             desired_device_preview_mode_for(true, Page::StandbySettings, StandbyTab::Standby),
             DevicePreviewMode::Standby
         );
-        for page in [
-            Page::Overview,
-            Page::LiveDisplay,
-            Page::Profiles,
-            Page::Diagnostics,
-            Page::Settings,
-        ] {
+        assert_eq!(
+            desired_device_preview_mode_for(true, Page::LiveDisplay, StandbyTab::Boot),
+            DevicePreviewMode::LiveDisplay
+        );
+        for page in [Page::Overview, Page::Diagnostics, Page::Settings] {
             assert_eq!(
                 desired_device_preview_mode_for(true, page, StandbyTab::Boot),
                 DevicePreviewMode::Off
@@ -4903,6 +5682,57 @@ mod device_preview_mode_tests {
             desired_device_preview_mode_for(false, Page::StandbySettings, StandbyTab::Boot),
             DevicePreviewMode::Off
         );
+    }
+
+    #[test]
+    fn live_preview_snapshot_uses_unsaved_edits_without_touching_committed_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let committed_path = dir.path().join("committed.toml");
+        let snapshot_path = dir.path().join("preview.toml");
+        let committed = Config::default();
+        committed.save(&committed_path).unwrap();
+        let mut working = committed.clone();
+        working.rotation = 37.5;
+        let snapshot = live_preview_config(
+            &working,
+            BackgroundSource::File,
+            Some("/tmp/preview-only.png"),
+            None,
+        );
+        write_live_preview_config(&snapshot_path, &snapshot).unwrap();
+        assert_eq!(Config::load(&snapshot_path).unwrap().rotation, 37.5);
+        assert_eq!(
+            Config::load(&snapshot_path)
+                .unwrap()
+                .background
+                .image_path
+                .as_deref(),
+            Some("/tmp/preview-only.png")
+        );
+        assert_eq!(Config::load(&committed_path).unwrap(), committed);
+        assert_eq!(
+            working.background.image_path,
+            committed.background.image_path
+        );
+        working.rotation = 91.0;
+        let updated = live_preview_config(
+            &working,
+            BackgroundSource::SolidColor,
+            Some("/tmp/ignored.png"),
+            None,
+        );
+        write_live_preview_config(&snapshot_path, &updated).unwrap();
+        assert_eq!(Config::load(&snapshot_path).unwrap().rotation, 91.0);
+        assert_eq!(
+            Config::load(&snapshot_path).unwrap().background.image_path,
+            None
+        );
+        assert_eq!(Config::load(&committed_path).unwrap(), committed);
+        let spec = build_live_preview_spec(&snapshot_path, 68);
+        assert_eq!(spec.mode, DevicePreviewMode::LiveDisplay);
+        assert_eq!(spec.args[0], "--preview-live");
+        assert_eq!(spec.args[2], snapshot_path.to_string_lossy());
+        assert_eq!(spec.args[4], "68");
     }
 
     #[test]
@@ -5012,6 +5842,31 @@ fn is_gif(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+fn validate_media_file(path: &Path, target: MediaDropTarget) -> Result<(), String> {
+    if !path.is_file() {
+        return Err(format!("Media file does not exist: {}", path.display()));
+    }
+    let file =
+        File::open(path).map_err(|error| format!("Cannot read {}: {error}", path.display()))?;
+    if target == MediaDropTarget::BootAnimation {
+        if !is_gif(path) {
+            return Err("Boot animation must be a GIF file".into());
+        }
+        GifDecoder::new(BufReader::new(file))
+            .map_err(|error| format!("Invalid boot GIF: {error}"))?;
+        return Ok(());
+    }
+    let recognized_image = image::ImageReader::open(path)
+        .and_then(|reader| reader.with_guessed_format())
+        .ok()
+        .and_then(|reader| reader.format())
+        .is_some();
+    if !recognized_image && Command::new("ffmpeg").arg("-version").output().is_err() {
+        return Err("This media type requires FFmpeg. Install ffmpeg and try again.".into());
+    }
+    Ok(())
+}
+
 fn file_name(path: Option<&PathBuf>) -> String {
     path.and_then(|p| p.file_name())
         .and_then(|s| s.to_str())
@@ -5119,6 +5974,121 @@ fn media_transform_args(media: &MediaTransform) -> Vec<String> {
             media.canvas_color[0], media.canvas_color[1], media.canvas_color[2]
         ),
     ]
+}
+
+fn standby_visibility_args(visible: bool) -> Vec<String> {
+    vec![
+        "--pump-temp-overlay".into(),
+        if visible { "show" } else { "hide" }.into(),
+    ]
+}
+
+fn standby_upload_args(
+    path: &str,
+    transform: &MediaTransform,
+    time: f64,
+    color: Option<[u8; 3]>,
+    overlay: Option<bool>,
+) -> Vec<String> {
+    let mut args = vec!["--upload-standby".into(), path.into()];
+    args.extend(media_transform_args(transform));
+    args.extend(["--media-time".into(), time.to_string()]);
+    if let Some([red, green, blue]) = color {
+        args.extend([
+            "--pump-temp-color".into(),
+            format!("#{red:02x}{green:02x}{blue:02x}"),
+        ]);
+    }
+    if let Some(visible) = overlay {
+        args.extend(standby_visibility_args(visible));
+    }
+    args
+}
+
+#[cfg(test)]
+mod confirmed_gui_parity_tests {
+    use super::{
+        media_drop_target, standby_upload_args, standby_visibility_args, validate_media_file,
+        LiveTab, MediaDropTarget, Page, StandbyTab,
+    };
+    use crate::config::MediaTransform;
+
+    #[test]
+    fn drop_routing_follows_only_the_active_editor() {
+        assert_eq!(
+            media_drop_target(Page::LiveDisplay, LiveTab::Background, StandbyTab::Boot),
+            Some(MediaDropTarget::LiveBackground)
+        );
+        assert_eq!(
+            media_drop_target(Page::LiveDisplay, LiveTab::Overlay, StandbyTab::Boot),
+            None
+        );
+        assert_eq!(
+            media_drop_target(Page::StandbySettings, LiveTab::Background, StandbyTab::Boot),
+            Some(MediaDropTarget::BootAnimation)
+        );
+        assert_eq!(
+            media_drop_target(
+                Page::StandbySettings,
+                LiveTab::Background,
+                StandbyTab::Standby
+            ),
+            Some(MediaDropTarget::StandbyMedia)
+        );
+        for page in [Page::Overview, Page::Diagnostics, Page::Settings] {
+            assert_eq!(
+                media_drop_target(page, LiveTab::Background, StandbyTab::Boot),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn drop_validation_rejects_missing_and_non_gif_boot_files() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(validate_media_file(
+            &dir.path().join("missing.gif"),
+            MediaDropTarget::BootAnimation
+        )
+        .is_err());
+        let image_path = dir.path().join("image.png");
+        image::RgbImage::new(2, 2).save(&image_path).unwrap();
+        assert!(validate_media_file(&image_path, MediaDropTarget::LiveBackground).is_ok());
+        assert!(validate_media_file(&image_path, MediaDropTarget::StandbyMedia).is_ok());
+        assert!(validate_media_file(&image_path, MediaDropTarget::BootAnimation).is_err());
+        let gif_path = dir.path().join("boot.gif");
+        image::RgbaImage::new(2, 2).save(&gif_path).unwrap();
+        assert!(validate_media_file(&gif_path, MediaDropTarget::BootAnimation).is_ok());
+    }
+
+    #[test]
+    fn standby_device_options_preserve_unknown_state_until_explicitly_selected() {
+        let transform = MediaTransform::default();
+        let unchanged = standby_upload_args("standby.png", &transform, 1.5, None, None);
+        assert!(!unchanged.contains(&"--pump-temp-color".to_string()));
+        assert!(!unchanged.contains(&"--pump-temp-overlay".to_string()));
+        let selected = standby_upload_args(
+            "standby.png",
+            &transform,
+            1.5,
+            Some([0, 85, 255]),
+            Some(false),
+        );
+        assert!(selected
+            .windows(2)
+            .any(|args| args == ["--pump-temp-color", "#0055ff"]));
+        assert!(selected
+            .windows(2)
+            .any(|args| args == ["--pump-temp-overlay", "hide"]));
+        assert_eq!(
+            standby_visibility_args(true),
+            ["--pump-temp-overlay", "show"]
+        );
+        assert_eq!(
+            standby_visibility_args(false),
+            ["--pump-temp-overlay", "hide"]
+        );
+    }
 }
 
 fn boot_edit_args(start_frame: usize, end_frame: usize, frame_delay_ms: u32) -> Vec<String> {

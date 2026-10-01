@@ -98,16 +98,22 @@ impl Device {
         Ok(())
     }
 
-    /// Query the device status packet containing coolant temperature and pump RPM.
+    /// Query pump status and coolant temperature using their separate commands.
     pub fn read_status(&mut self) -> io::Result<DeviceStatus> {
         self.ctrl_write(&[0x80, 0x01, 0x00, 0x80])?;
         let resp = self.ctrl_read()?;
-        parse_status(&resp)
+        let pump_rpm = parse_pump_rpm(&resp)?;
+        let coolant_temp_c = self.read_liquid_temp()?;
+        Ok(DeviceStatus {
+            coolant_temp_c,
+            pump_rpm,
+        })
     }
 
     /// Query device for liquid coolant temperature.
     pub fn read_liquid_temp(&mut self) -> io::Result<f32> {
-        self.read_status().map(|status| status.coolant_temp_c)
+        self.ctrl_write(&[0x82, 0x01, 0x00, 0x80])?;
+        parse_liquid_temp(&self.ctrl_read()?)
     }
 
     /// Stream JPEG data without writing a control-interface brightness value.
@@ -277,30 +283,27 @@ impl Device {
     }
 }
 
-fn parse_status(resp: &[u8; CTRL_SIZE]) -> io::Result<DeviceStatus> {
-    // The status response starts `80 01 00 80 temp+0x24 temp+0x25 rpm_hi rpm_lo`.
-    let encoded = resp[4];
-    if resp[..4] != [0x80, 0x01, 0x00, 0x80]
-        || encoded < 0x24
-        || resp[5] != encoded.saturating_add(1)
-    {
+fn parse_pump_rpm(resp: &[u8; CTRL_SIZE]) -> io::Result<u16> {
+    if resp[..4] != [0x80, 0x01, 0x00, 0x80] {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "invalid device status response",
         ));
     }
-    Ok(DeviceStatus {
-        coolant_temp_c: (encoded - 0x24) as f32,
-        pump_rpm: u16::from_be_bytes([resp[6], resp[7]]),
-    })
+    Ok(u16::from_be_bytes([resp[6], resp[7]]))
 }
 
-#[cfg(test)]
 fn parse_liquid_temp(resp: &[u8; CTRL_SIZE]) -> io::Result<f32> {
-    // The status response starts `80 01 00 80 temp+0x24 temp+0x25 ...`.
-    // The adjacent encoding acts as a small integrity check. Bytes 6-7 are
-    // instead pump RPM (e.g. 09 10 = 2320 RPM).
-    parse_status(resp).map(|status| status.coolant_temp_c)
+    // The same-device FanControl plugin reads bytes 4-5 of the 0x82 reply
+    // as little-endian centidegrees. The 0x80 bytes are not temperature.
+    let centidegrees = u16::from_le_bytes([resp[4], resp[5]]);
+    if resp[..4] != [0x82, 0x01, 0x00, 0x80] || centidegrees > 10_000 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid coolant response: {:02x?}", &resp[..8]),
+        ));
+    }
+    Ok(centidegrees as f32 / 100.0)
 }
 
 /// Build the verified `Update_Boot_GIF` container from encoded JPEG frames.
@@ -439,13 +442,62 @@ mod tests {
     }
 
     #[test]
-    fn coolant_temperature_uses_encoded_status_field() {
+    fn coolant_temperature_uses_separate_centidegree_response() {
         let mut response = [0u8; CTRL_SIZE];
         response[..8].copy_from_slice(&[0x80, 0x01, 0x00, 0x80, 0x3e, 0x3f, 0x09, 0x10]);
-
-        assert_eq!(parse_liquid_temp(&response).unwrap(), 26.0);
-        response[5] = 0;
+        assert_eq!(parse_pump_rpm(&response).unwrap(), 2320);
         assert!(parse_liquid_temp(&response).is_err());
+
+        response[..4].copy_from_slice(&[0x82, 0x01, 0x00, 0x80]);
+        for centidegrees in [0u16, 2600, 3100, 3125, 10_000] {
+            response[4..6].copy_from_slice(&centidegrees.to_le_bytes());
+            assert_eq!(
+                parse_liquid_temp(&response).unwrap(),
+                centidegrees as f32 / 100.0
+            );
+        }
+        response[4..6].copy_from_slice(&u16::MAX.to_le_bytes());
+        assert!(parse_liquid_temp(&response).is_err());
+        response[0] = 0x12;
+        assert!(parse_pump_rpm(&response).is_err());
+    }
+
+    #[test]
+    fn status_queries_pump_and_temperature_separately() {
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixStream;
+
+        let (control, mut firmware) = UnixStream::pair().unwrap();
+        firmware
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let firmware_thread = thread::spawn(move || {
+            for (command, payload) in [
+                (0x80, [0x3e, 0x3f, 0x09, 0x10]),
+                (0x82, [0x1c, 0x0c, 0x00, 0x00]),
+            ] {
+                let mut request = [0u8; CTRL_SIZE];
+                firmware.read_exact(&mut request).unwrap();
+                assert_eq!(&request[..4], &[command, 0x01, 0x00, 0x80]);
+                assert!(request[4..].iter().all(|byte| *byte == 0));
+                let mut reply = [0u8; CTRL_SIZE];
+                reply[..4].copy_from_slice(&request[..4]);
+                reply[4..8].copy_from_slice(&payload);
+                firmware.write_all(&reply).unwrap();
+            }
+        });
+        let mut device = Device {
+            ctrl: File::from(OwnedFd::from(control)),
+            image: File::open("/dev/null").unwrap(),
+        };
+        assert_eq!(
+            device.read_status().unwrap(),
+            DeviceStatus {
+                coolant_temp_c: 31.0,
+                pump_rpm: 2320,
+            }
+        );
+        firmware_thread.join().unwrap();
     }
 
     #[test]
