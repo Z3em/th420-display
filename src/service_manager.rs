@@ -74,7 +74,7 @@ impl ServiceManager {
     }
 
     #[cfg(test)]
-    fn for_kind(kind: BackendKind) -> Self {
+    pub(crate) fn for_kind(kind: BackendKind) -> Self {
         Self { kind }
     }
 

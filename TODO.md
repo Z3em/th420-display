@@ -23,6 +23,17 @@ imply user verification or a physical-device test unless the note says so.
 
 ## Identified
 
+- [ ] **AppImage daemon extraction** — the old GUIs could extract the bundled
+  daemon to a stable path; `gui_v2` only selects an existing local daemon or the
+  sibling executable. Review bundled-daemon installation/update and selection
+  so an AppImage does not use an outdated local daemon or leave autostart
+  pointing inside a temporary mount. Keep this separate from desktop integration.
+
+- [ ] **Label X/Y controls** — widget templates and instance overrides support
+  label X/Y offsets in TOML, but `gui_v2` exposes only template Y and neither
+  instance offset. Decide how to expose relative label placement and inheritance
+  in the new widget model, replacing the old separate label/value positioning.
+
 - [ ] **Synchronize window and device animation playback** — coordinate animation
   timing between the GUI preview and the physical display for both boot preview
   and ordinary live mode, avoiding independent starts and accumulated drift.
@@ -80,6 +91,137 @@ Automated tests do not establish GUI or hardware acceptance.
   (tracked in Identified), and interactive validation of the new controls.
 
 ## Complete
+
+Validation for the four tasks below (2026-10-02): all 160 GUI and 125 daemon
+tests passed; formatting, diff checks, and Clippy passed (with warnings), and
+both release binaries were rebuilt. No persistent hardware writes were performed.
+Interactive GUI/device acceptance remains pending user verification.
+
+- [x] **Background device jobs** — run uploads and other device commands without
+  blocking the GUI. Restore visible job status and cancellation where safe,
+  coordinate exclusive device ownership and daemon restoration, and report
+  failures clearly. Cancellation is limited to preparation/device handoff;
+  a Stop action must not imply rollback of a flash write.
+
+  Approved implementation plan (implemented):
+  - Replace synchronous `run_short_device_command` with a single background
+    job coordinator. Capture an immutable operation specification (media path,
+    transforms, trim/timing, brightness, visibility, and color as applicable)
+    when submitted; later editor changes cannot alter that operation.
+  - Run preparation, device handoff, child execution, output collection, and
+    restoration off the GUI thread. Poll typed job events in the GUI and show
+    Preparing / Waiting for device / Writing / Restoring daemon / final status
+    globally above Display Preview. Capture bounded output and retain failures
+    in Diagnostics; show actual progress only where the helper reports it.
+  - Allow one device job at a time. Disable competing upload, brightness,
+    visibility, snapshot, daemon-control, and device-preview actions while it
+    owns the workflow; editors remain usable. Do not silently queue operations.
+    Allow a pending telemetry snapshot to finish before starting the job.
+  - Prepare and validate media before requesting device ownership. Pause a
+    running daemon using the existing acknowledged handoff, then use the
+    helper's DeviceGuard. Resume only the daemon this job paused, after the
+    helper has exited and released the device. Preserve an already-paused or
+    stopped daemon. Abort on failed handoff; report operation and resume errors
+    separately so a successful upload is not misreported as failed.
+  - Split cancellable preparation from device writes with an explicit worker/
+    helper readiness gate. Cancel during preparation or while awaiting handoff
+    prevents any device write and performs cleanup/restoration. Before granting
+    the write phase, atomically disable Cancel; once writing starts, finish the
+    operation rather than terminating an upload mid-transaction. No rollback
+    is promised. Do not automatically retry persistent writes after errors.
+  - Defer ordinary GUI closure during Writing/Restoring until the job finishes;
+    close during preparation cancels cleanly. Clearly report interrupted or
+    uncertain device state on write failure, retaining the recoverable daemon
+    pause state if restoration fails. Keep preview On/Off separate from job
+    cancellation.
+  - Validate with fake helpers and control endpoints: responsiveness, captured
+    arguments, duplicate rejection, cancel/write-gate races, handoff failure,
+    process failure, bounded output, cleanup, closure, and exactly-once resume.
+    Complete interactive upload/brightness/visibility verification separately.
+
+  Completion: implemented on 2026-10-02; automated checks passed. Interactive
+  GUI/device acceptance remains pending user verification.
+
+- [x] **Keyboard nudging** — restore arrow-key movement of the selected widget
+  (1 px) and Shift+arrow coarse movement (5 px), respecting keyboard focus,
+  the new placement/snapping behavior, and Undo/Redo. Decide interactions with
+  snapping during planning rather than silently changing committed coordinates.
+
+  Approved implementation plan (implemented):
+  - Activate only for a selected visible widget on Live Display's widget tab,
+    with no modal, focused editor, or active pointer drag/rotation. Keep numeric
+    and text fields' arrow-key behavior; consume handled keys and ignore command/
+    control/Alt combinations reserved for other shortcuts.
+  - With snapping off, arrows move 1 canvas pixel; Shift+arrow moves 5 pixels.
+    With snapping on, arrows move to the next grid line in the chosen direction;
+    Shift moves five grid lines. Starting between lines must still produce
+    visible movement on the first press. Change only the addressed axis;
+    preserve the other coordinate and rotation, including an existing position
+    set with a different grid. No persistent unsnapped accumulator is needed.
+  - Use shared center-origin snap math and the widget target's own settings.
+    Changing grid size never moves anything by itself. Update window/device
+    previews through their existing working-config refresh path.
+  - Record one undo transaction per held-key gesture (including repeats), ending
+    on release, selection/page/focus change, or modifier/grid change. Account for
+    keyboard mutation before the current frame's `before` config snapshot so
+    it cannot escape history or merge with an unrelated edit.
+  - Add shortcut hints and tests for 1/5-pixel and grid steps, negative/off-grid
+    positions, axis preservation, repeats, focus/modal exclusion, and Undo/Redo.
+
+  Completion: implemented on 2026-10-02; automated checks passed. Interactive
+  GUI/device acceptance remains pending user verification.
+
+- [x] **Threshold visualization** — restore an interpolated threshold-color
+  gradient, current-reading marker where a source is available, and units beside
+  threshold values in the template/instance color editors. Preserve inheritance
+  and avoid implying one current reading for templates used by multiple sources.
+
+  Approved implementation plan (implemented):
+  - Add a shared read-only gradient preview above threshold rows using the same
+    interpolation function as the renderer. Show numeric endpoints and units,
+    retaining the existing stable row IDs and RGB/hex editor behavior.
+  - In instance editors, use resolved source units and a finite current reading
+    for a labelled marker. Clamp only the marker to the preview range, not the
+    reading; indicate out-of-range values. Show unavailable readings explicitly.
+  - Show the inherited map preview even without overrides; edits still require
+    Override template thresholds. Use template thresholds restores inheritance.
+  - Templates have no unique data source. Offer an optional preview-only source
+    selector for units/current-value context, defaulting to no sample; never
+    choose the first referencing instance implicitly. Keep that choice outside
+    runtime configuration and Undo history.
+  - Handle empty maps, one threshold, equal endpoints, duplicate thresholds,
+    and non-finite readings without invalid geometry. Preserve current renderer
+    interpolation semantics, including how equal thresholds are resolved.
+  - Test range/marker calculations and inheritance; visually check edits,
+    gradient colors, units, unavailable values, and mixed-source templates.
+
+  Completion: implemented on 2026-10-02; automated checks passed. Interactive
+  GUI/device acceptance remains pending user verification.
+
+- [x] **Reset confirmation** — confirm Reset working configuration before
+  replacing edits with defaults. Explain that the reset affects the working
+  configuration and requires Apply to save; retain Undo recovery and keep the
+  background editor state consistent with the reset configuration.
+
+  Approved implementation plan (implemented):
+  - Reset opens a Cancel / Reset working configuration modal. State explicitly
+    that defaults replace unsaved runtime edits, Apply saves them, and Boot/
+    Standby uploads, device brightness, service state, and profiles are separate.
+    Cancel/Escape leaves configuration and editor state untouched.
+  - On confirmation, flush pending edit history and record the reset as one
+    undoable transaction. Replace only the working runtime configuration with
+    defaults; retain committed configuration and stored profiles until Apply.
+  - Synchronize background source/path, clear stale widget/template selections
+    and active gestures, and invalidate affected previews. Ensure Apply cannot
+    reinsert the pre-reset background path. Undo/Redo must synchronize editor
+    state with the restored config too; Revert still restores committed config.
+  - If Live device preview is active, defaults appear through the normal
+    transient preview update; disclose this in the modal. Reset sends no
+    persistent device command and does not reset Boot/Standby media or snapping.
+  - Test cancel, reset history, Apply/Revert, path synchronization, and defaults
+    after Undo/Redo. Check the modal and active Live preview interactively.
+  Completion: implemented on 2026-10-02; automated checks passed. Interactive
+  GUI/device acceptance remains pending user verification.
 
 - [x] **Restore standby coolant-text controls in `gui_v2`** — Standby now has
   explicit Keep unchanged / Show / Hide visibility, a separate Apply visibility

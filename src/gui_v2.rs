@@ -1,5 +1,7 @@
 mod config;
+mod device_job;
 mod instance;
+mod job_protocol;
 mod profile;
 mod renderer;
 mod sensors;
@@ -270,6 +272,8 @@ struct App {
     selected_profile: Option<String>,
     profile_name_edit: String,
     confirm_delete_profile: bool,
+    confirm_reset: bool,
+    nudge_history: Option<(Config, String, bool, bool, f32)>,
     undo: Vec<Config>,
     redo: Vec<Config>,
     pending_undo: Option<Config>,
@@ -361,6 +365,10 @@ struct App {
     device_preview_refresh_now: bool,
     status_text: String,
     last_error: Option<String>,
+    device_job: Option<device_job::Job>,
+    queued_device_job: Option<(String, Vec<String>)>,
+    last_device_job_output: String,
+    close_after_job: bool,
 }
 
 #[derive(Parser)]
@@ -539,12 +547,33 @@ impl App {
             .and_then(|owner| request_daemon_command(&owner, "state", Duration::from_secs(1)).ok())
             .is_some_and(|state| state == "paused");
         let autostart_enabled = service_manager.autostart_enabled();
+        Self::from_loaded_config(
+            config_path,
+            config,
+            shutdown_requested,
+            (
+                service_manager,
+                daemon_running,
+                daemon_paused,
+                autostart_enabled,
+            ),
+            ProfileStore::new(),
+        )
+    }
+
+    fn from_loaded_config(
+        config_path: PathBuf,
+        config: Config,
+        shutdown_requested: Arc<AtomicBool>,
+        runtime: (ServiceManager, bool, bool, bool),
+        profiles: ProfileStore,
+    ) -> Self {
+        let (service_manager, daemon_running, daemon_paused, autostart_enabled) = runtime;
         let background_source = if config.background.image_path.is_some() {
             BackgroundSource::File
         } else {
             BackgroundSource::SolidColor
         };
-        let profiles = ProfileStore::new();
         let selected_profile = profiles.active_name();
 
         let (boot_inspection_tx, boot_inspection_rx) = mpsc::channel();
@@ -570,6 +599,8 @@ impl App {
             selected_profile,
             profile_name_edit: String::new(),
             confirm_delete_profile: false,
+            confirm_reset: false,
+            nudge_history: None,
             undo: Vec::new(),
             redo: Vec::new(),
             pending_undo: None,
@@ -657,6 +688,10 @@ impl App {
             device_preview_refresh_now: false,
             status_text: String::new(),
             last_error: None,
+            device_job: None,
+            queued_device_job: None,
+            last_device_job_output: String::new(),
+            close_after_job: false,
         };
         app.refresh_sensors();
         if daemon_running && !daemon_paused {
@@ -676,6 +711,7 @@ impl App {
     }
 
     fn poll(&mut self) {
+        self.poll_device_job();
         while let Ok(result) = self.device_status_rx.try_recv() {
             self.device_status_pending = false;
             match result {
@@ -1000,6 +1036,7 @@ impl App {
     }
 
     fn apply(&mut self) {
+        self.finish_nudge();
         self.working.background.image_path = match self.background_source {
             BackgroundSource::File => self.background_file_path.clone(),
             BackgroundSource::Stream => self
@@ -1043,6 +1080,7 @@ impl App {
     }
 
     fn revert(&mut self) {
+        self.finish_nudge();
         self.working = self.committed.clone();
         self.undo.clear();
         self.redo.clear();
@@ -1083,6 +1121,7 @@ impl App {
     }
 
     fn undo(&mut self) {
+        self.finish_nudge();
         if let Some(previous) = self.undo.pop() {
             self.redo.push(self.working.clone());
             self.working = previous;
@@ -1093,6 +1132,7 @@ impl App {
     }
 
     fn redo(&mut self) {
+        self.finish_nudge();
         if let Some(next) = self.redo.pop() {
             self.undo.push(self.working.clone());
             self.working = next;
@@ -1103,6 +1143,9 @@ impl App {
     }
 
     fn capture_history(&mut self, before: Config, ctx: &egui::Context) {
+        if before != self.working {
+            self.finish_nudge();
+        }
         if self.suppress_history_once {
             self.suppress_history_once = false;
             self.pending_undo = None;
@@ -1125,8 +1168,102 @@ impl App {
         }
     }
 
+    fn finish_nudge(&mut self) {
+        if let Some((before, ..)) = self.nudge_history.take() {
+            self.push_undo(before);
+        }
+    }
+
+    fn reset_working_config(&mut self) {
+        self.finish_nudge();
+        if let Some(before) = self.pending_undo.take() {
+            self.push_undo(before);
+        }
+        let before = self.working.clone();
+        self.working = Config::default();
+        self.push_undo(before);
+        self.suppress_history_once = true;
+        self.selected_sensor = None;
+        self.editing_widget_template = None;
+        self.add_widget_template = BUILTIN_SENSOR_TEMPLATE_ID.into();
+        self.widget_drag = None;
+        self.widget_rotation_drag = None;
+        self.background_drag = None;
+        self.background_rotation_drag = None;
+        self.sync_background_source();
+    }
+
+    fn show_reset_confirmation(&mut self, ctx: &egui::Context) {
+        if !self.confirm_reset {
+            return;
+        }
+        let mut reset = false;
+        let mut cancel = ctx.input(|input| input.key_pressed(egui::Key::Escape));
+        egui::Modal::new(egui::Id::new("confirm-reset-working")).show(ctx, |ui| {
+                ui.heading("Reset working configuration?");
+                ui.label("Replace unsaved runtime edits with defaults? Apply saves the result. Undo can restore your edits.");
+                ui.label("Stored profiles, Boot/Standby media, device brightness, snapping, and service state are not reset.");
+                if self.device_preview_enabled && self.page == Page::LiveDisplay {
+                    ui.label("Defaults will immediately appear in the active Live device preview.");
+                }
+                ui.horizontal(|ui| {
+                    cancel |= ui.button("Cancel").clicked();
+                    reset = ui.button("Reset working configuration").clicked();
+                });
+            });
+        if cancel || reset {
+            self.confirm_reset = false;
+        }
+        if reset {
+            self.reset_working_config();
+        }
+    }
+
     fn handle_keyboard(&mut self, ctx: &egui::Context) {
-        if ctx.wants_keyboard_input() {
+        let arrow_keys = [
+            egui::Key::ArrowLeft,
+            egui::Key::ArrowRight,
+            egui::Key::ArrowUp,
+            egui::Key::ArrowDown,
+        ];
+        let (held, shift, blocked_modifiers) = ctx.input(|input| {
+            (
+                arrow_keys.iter().any(|key| input.key_down(*key)),
+                input.modifiers.shift,
+                input.modifiers.command || input.modifiers.ctrl || input.modifiers.alt,
+            )
+        });
+        let selection = self.selected_sensor.clone().unwrap_or_default();
+        let eligible = self.page == Page::LiveDisplay
+            && self.live_tab == LiveTab::Overlay
+            && !self.confirm_reset
+            && !self.confirm_delete_profile
+            && !ctx.wants_keyboard_input()
+            && !blocked_modifiers
+            && !ctx.input(|input| input.pointer.any_down())
+            && self.widget_drag.is_none()
+            && self.widget_rotation_drag.is_none()
+            && self.working.overlay_enabled
+            && self
+                .working
+                .widget_instances
+                .iter()
+                .any(|widget| widget.id == selection && widget.visible);
+        if self
+            .nudge_history
+            .as_ref()
+            .is_some_and(|(_, id, coarse, snap, grid)| {
+                !held
+                    || !eligible
+                    || id != &selection
+                    || *coarse != shift
+                    || *snap != self.widget_snap.enabled
+                    || *grid != self.widget_snap.pan_grid
+            })
+        {
+            self.finish_nudge();
+        }
+        if ctx.wants_keyboard_input() || self.confirm_reset || self.confirm_delete_profile {
             return;
         }
         let undo = ctx.input(|input| {
@@ -1143,9 +1280,68 @@ impl App {
         if redo {
             self.redo();
         }
+        if eligible && !undo && !redo {
+            let mut delta = [0i32; 2];
+            for (key, axis, direction) in [
+                (egui::Key::ArrowLeft, 0, -1),
+                (egui::Key::ArrowRight, 0, 1),
+                (egui::Key::ArrowUp, 1, -1),
+                (egui::Key::ArrowDown, 1, 1),
+            ] {
+                if ctx.input_mut(|input| {
+                    input.consume_key(
+                        egui::Modifiers {
+                            shift,
+                            ..Default::default()
+                        },
+                        key,
+                    )
+                }) {
+                    delta[axis] += direction;
+                }
+            }
+            if delta != [0, 0] {
+                if self.nudge_history.is_none() {
+                    if let Some(before) = self.pending_undo.take() {
+                        self.push_undo(before);
+                    }
+                    self.nudge_history = Some((
+                        self.working.clone(),
+                        selection.clone(),
+                        shift,
+                        self.widget_snap.enabled,
+                        self.widget_snap.pan_grid,
+                    ));
+                }
+                let widget = self
+                    .working
+                    .widget_instances
+                    .iter_mut()
+                    .find(|widget| widget.id == selection)
+                    .unwrap();
+                widget.transform.pan_x = nudge_coordinate(
+                    widget.transform.pan_x,
+                    delta[0],
+                    shift,
+                    self.widget_snap.enabled,
+                    self.widget_snap.pan_grid,
+                );
+                widget.transform.pan_y = nudge_coordinate(
+                    widget.transform.pan_y,
+                    delta[1],
+                    shift,
+                    self.widget_snap.enabled,
+                    self.widget_snap.pan_grid,
+                );
+                self.preview_texture = None;
+            }
+        }
     }
 
     fn set_live_display(&mut self, enabled: bool) {
+        if self.device_job_busy() {
+            return;
+        }
         self.live_display_enabled = enabled;
         if !enabled {
             self.pending_live_start = false;
@@ -1161,6 +1357,9 @@ impl App {
     }
 
     fn start_live_daemon(&mut self) -> bool {
+        if self.device_job_busy() {
+            return false;
+        }
         if self.device_status_pending {
             self.pending_live_start = true;
             self.status_text =
@@ -1263,7 +1462,10 @@ impl App {
                     ui.add(egui::Slider::new(&mut self.brightness, 0..=100).suffix("%"));
                     if ui
                         .add_enabled(
-                            self.device_info.connected && self.device_preview_job.is_none(),
+                            self.device_info.connected
+                                && self.device_preview_job.is_none()
+                                && !self.device_preview_enabled
+                                && !self.device_job_busy(),
                             egui::Button::new("Set"),
                         )
                         .clicked()
@@ -1316,14 +1518,16 @@ impl App {
                     let running = self.daemon_running || self.pending_live_start;
                     let label = if running { "Stop" } else { "Start" };
                     let response = ui.add_enabled(
-                        self.device_preview_job.is_none() && !self.daemon_paused,
+                        self.device_preview_job.is_none()
+                            && !self.daemon_paused
+                            && !self.device_job_busy(),
                         egui::Button::new(label),
                     );
                     if response.clicked() {
                         self.set_live_display(!running);
                     }
                     if self.daemon_paused {
-                        ui.label("Paused for device preview");
+                        ui.label("Daemon paused");
                     } else if self.pending_live_start {
                         ui.label("Starting…");
                     }
@@ -1335,7 +1539,10 @@ impl App {
                     } else {
                         "Turn on"
                     };
-                    if ui.button(label).clicked() {
+                    if ui
+                        .add_enabled(!self.device_job_busy(), egui::Button::new(label))
+                        .clicked()
+                    {
                         self.device_preview_enabled = !self.device_preview_enabled;
                         self.preview_missing_reported = false;
                     }
@@ -1345,6 +1552,24 @@ impl App {
                 });
                 ui.separator();
                 ui.heading("Display Preview");
+                if let Some(job) = &self.device_job {
+                    ui.label(format!("{}: {}", job.label, job.phase().label()));
+                    ui.spinner();
+                    if ui
+                        .add_enabled(job.phase().cancellable(), egui::Button::new("Cancel job"))
+                        .clicked()
+                    {
+                        job.cancel();
+                    }
+                } else if let Some((label, _)) = &self.queued_device_job {
+                    ui.label(format!("{label}: waiting for telemetry snapshot"));
+                    if ui.button("Cancel job").clicked() {
+                        self.queued_device_job = None;
+                    }
+                }
+                if self.close_after_job {
+                    ui.label("Finishing device job before closing…");
+                }
                 ui.add_space(8.0);
                 self.update_preview_texture(ctx);
                 if self.page == Page::LiveDisplay && self.live_tab == LiveTab::Background {
@@ -2142,6 +2367,9 @@ impl App {
         if self.daemon_paused && self.preview_paused_daemon.is_none() {
             ui.add_space(8.0);
             ui.horizontal(|ui| {
+                if self.device_job_busy() {
+                    ui.disable();
+                }
                 ui.label(egui::RichText::new("Live daemon is paused").color(egui::Color32::YELLOW));
                 if ui.button("Resume daemon").clicked() {
                     if let Some(owner) = current_owner(InstanceKind::Daemon) {
@@ -2171,6 +2399,7 @@ impl App {
                     .add_enabled(
                         self.device_info.connected
                             && self.device_preview_job.is_none()
+                            && !self.device_job_busy()
                             && !self.daemon_paused
                             && !self.device_status_pending,
                         egui::Button::new(if self.daemon_running {
@@ -2617,6 +2846,7 @@ impl App {
     fn show_overlay_editor(&mut self, ui: &mut egui::Ui) {
         ui.add_space(6.0);
         ui.label(egui::RichText::new("Widgets").strong());
+        ui.label(egui::RichText::new("Arrow keys move the selected widget; Shift moves five steps. With snapping on, steps follow grid lines.").small());
         ui.horizontal(|ui| {
             egui::ComboBox::from_id_salt("add-widget-template")
                 .selected_text(
@@ -2876,11 +3106,29 @@ impl App {
                             instance.overrides.color_map = Some(resolved.style.color_map.clone());
                         }
                         if let Some(map) = &mut instance.overrides.color_map {
-                            color_map_editor(ui, map, &instance.id);
+                            color_map_editor(
+                                ui,
+                                map,
+                                &instance.id,
+                                &resolved.unit,
+                                self.sensor_values
+                                    .readings
+                                    .get(&resolved.source_id)
+                                    .copied(),
+                            );
                             if ui.small_button("Use template thresholds").clicked() {
                                 instance.overrides.color_map = None;
                             }
                         } else {
+                            threshold_preview(
+                                ui,
+                                &resolved.style.color_map,
+                                &resolved.unit,
+                                self.sensor_values
+                                    .readings
+                                    .get(&resolved.source_id)
+                                    .copied(),
+                            );
                             ui.label(
                                 egui::RichText::new("Inherited from template")
                                     .small()
@@ -2989,11 +3237,42 @@ impl App {
                 return;
             };
             let built_in = self.working.widget_templates[index].built_in;
+            let sample_key = ui.id().with((&id, "threshold-preview-source"));
+            let mut sample = ui
+                .ctx()
+                .data_mut(|data| data.get_temp::<String>(sample_key))
+                .unwrap_or_default();
+            egui::ComboBox::from_label("Threshold preview source")
+                .selected_text(if sample.is_empty() {
+                    "No sample"
+                } else {
+                    &sample
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut sample, String::new(), "No sample");
+                    for source in &self.working.sensors {
+                        ui.selectable_value(&mut sample, source.id.clone(), &source.label);
+                    }
+                });
+            ui.ctx()
+                .data_mut(|data| data.insert_temp(sample_key, sample.clone()));
+            let unit = self
+                .working
+                .sensor_by_id(&sample)
+                .map(|source| source.unit.clone())
+                .unwrap_or_default();
+            let reading = self.sensor_values.readings.get(&sample).copied();
             if built_in {
                 ui.label(
                     egui::RichText::new("Built-in templates are read-only")
                         .small()
                         .color(egui::Color32::GRAY),
+                );
+                threshold_preview(
+                    ui,
+                    &self.working.widget_templates[index].style.color_map,
+                    &unit,
+                    reading,
                 );
             } else {
                 let template = &mut self.working.widget_templates[index];
@@ -3045,7 +3324,13 @@ impl App {
                     background_transparency_slider(ui, &mut template.style.background_opacity);
                 });
                 ui.collapsing("Default threshold colors", |ui| {
-                    color_map_editor(ui, &mut template.style.color_map, &template.id);
+                    color_map_editor(
+                        ui,
+                        &mut template.style.color_map,
+                        &template.id,
+                        &unit,
+                        reading,
+                    );
                 });
             }
             ui.horizontal(|ui| {
@@ -3272,7 +3557,11 @@ impl App {
         };
         if ui
             .add_enabled(
-                self.device_info.connected && self.boot_path.is_some() && boot_upload_ready,
+                self.device_info.connected
+                    && self.boot_path.is_some()
+                    && boot_upload_ready
+                    && !self.device_preview_enabled
+                    && !self.device_job_busy(),
                 egui::Button::new("Upload to device"),
             )
             .clicked()
@@ -3365,7 +3654,8 @@ impl App {
                 self.standby_overlay.is_some()
                     && self.device_info.connected
                     && self.device_preview_job.is_none()
-                    && !self.daemon_paused,
+                    && !self.device_preview_enabled
+                    && !self.device_job_busy(),
                 egui::Button::new("Apply text visibility now"),
             )
             .clicked()
@@ -3405,7 +3695,8 @@ impl App {
                 self.device_info.connected
                     && standby_frame_ready
                     && self.device_preview_job.is_none()
-                    && !self.daemon_paused,
+                    && !self.device_preview_enabled
+                    && !self.device_job_busy(),
                 egui::Button::new("Upload persistent standby image"),
             )
             .clicked()
@@ -3635,6 +3926,9 @@ impl App {
         ui.add_space(8.0);
         ui.group(|ui| {
             ui.label(egui::RichText::new("Application / service").strong());
+            if self.device_job_busy() {
+                ui.disable();
+            }
             let mut autostart = self.autostart_enabled;
             if ui
                 .checkbox(&mut autostart, "Start Live Display on login")
@@ -3669,8 +3963,7 @@ impl App {
                 path_or_dash(self.device_info.image_hidraw.as_ref())
             ));
             if ui.button("Reset working configuration").clicked() {
-                self.working = Config::default();
-                self.selected_sensor = None;
+                self.confirm_reset = true;
             }
         });
     }
@@ -3842,6 +4135,19 @@ impl App {
 
     fn diagnostics_text(&self) -> String {
         let mut output = String::from("TH420 Display diagnostics\n\n");
+        if let Some(job) = &self.device_job {
+            output.push_str(&format!(
+                "runtime.device_job={}\njob.phase={}\n",
+                job.label,
+                job.phase().label()
+            ));
+        }
+        if !self.last_device_job_output.is_empty() {
+            output.push_str(&format!(
+                "job.last_output={}\n",
+                self.last_device_job_output
+            ));
+        }
         output.push_str(&format!(
             "device.connected={}\ndevice.usb_id={}:{}\n",
             self.device_info.connected, self.device_info.vid, self.device_info.pid
@@ -3913,6 +4219,7 @@ impl App {
                 .add_enabled(
                     self.device_info.connected
                         && self.device_preview_job.is_none()
+                        && !self.device_job_busy()
                         && !self.daemon_paused
                         && !self.device_status_pending,
                     egui::Button::new(if self.daemon_running {
@@ -3936,6 +4243,9 @@ impl App {
     }
 
     fn start_device_status_refresh(&mut self, allow_offline_snapshot: bool) {
+        if self.device_job_busy() {
+            return;
+        }
         if self.device_status_pending {
             return;
         }
@@ -3950,28 +4260,94 @@ impl App {
         });
     }
 
+    fn device_job_busy(&self) -> bool {
+        self.device_job.is_some() || self.queued_device_job.is_some()
+    }
+
     fn run_short_device_command(&mut self, label: &str, args: Vec<String>) {
-        if self.device_preview_job.is_some() {
+        if self.device_job_busy()
+            || self.device_preview_enabled
+            || self.device_preview_job.is_some()
+        {
+            self.last_error =
+                Some("Finish the active device job or turn device preview off first".into());
             return;
         }
-        let restore = self.daemon_running;
-        if restore && !self.stop_live_daemon() {
-            return;
-        }
-        let result = Command::new(daemon_binary_path()).args(args).output();
-        if restore {
-            self.start_live_daemon();
-        }
-        match result {
-            Ok(output) if output.status.success() => self.status_text = format!("{label} complete"),
-            Ok(output) => {
+        self.queued_device_job = Some((label.into(), args));
+        self.poll_device_job();
+    }
+
+    fn poll_device_job(&mut self) {
+        let outcome = self
+            .device_job
+            .as_ref()
+            .and_then(|job| match job.receiver.try_recv() {
+                Ok(outcome) => Some(outcome),
+                Err(mpsc::TryRecvError::Empty) => None,
+                Err(mpsc::TryRecvError::Disconnected) => Some(device_job::Outcome {
+                    operation: Err(
+                        "Device worker disconnected unexpectedly; inspect device state".into(),
+                    ),
+                    restoration: Err("Check daemon state before resuming".into()),
+                    output: String::new(),
+                }),
+            });
+        if let Some(outcome) = outcome {
+            let label = self.device_job.take().unwrap().label.clone();
+            self.last_device_job_output = outcome.output;
+            let operation_failed = outcome.operation.is_err();
+            self.status_text = match outcome.operation {
+                Ok(()) => format!("{label} complete"),
+                Err(error) => {
+                    self.last_error = Some(format!("{label}: {error}"));
+                    format!("{label} did not complete")
+                }
+            };
+            if let Err(error) = outcome.restoration {
                 self.last_error = Some(format!(
-                    "{label} failed: {}",
-                    String::from_utf8_lossy(&output.stderr).trim()
+                    "{}; daemon restoration failed: {error}",
+                    if operation_failed {
+                        self.last_error.as_deref().unwrap_or(&self.status_text)
+                    } else {
+                        &self.status_text
+                    }
                 ));
             }
-            Err(err) => self.last_error = Some(format!("{label} failed: {err}")),
+            self.last_daemon_check = Instant::now() - Duration::from_secs(5);
+            self.device_status_live = false;
+            self.refresh_sensors();
         }
+        if self.device_job.is_none() && !self.device_status_pending {
+            if let Some((label, args)) = self.queued_device_job.take() {
+                self.device_job = Some(device_job::Job::start(
+                    daemon_binary_path(),
+                    args,
+                    label,
+                    current_owner(InstanceKind::Daemon),
+                ));
+            }
+        }
+    }
+
+    fn handle_close_request(&mut self, ctx: &egui::Context) -> bool {
+        if self.shutdown_requested.load(Ordering::SeqCst)
+            || ctx.input(|input| input.viewport().close_requested())
+        {
+            self.close_after_job = true;
+            self.queued_device_job = None;
+            if let Some(job) = &self.device_job {
+                job.cancel();
+            }
+        }
+        if self.close_after_job {
+            if self.device_job_busy() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            } else {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                return true;
+            }
+        }
+        false
     }
 
     fn desired_device_preview_mode(&self) -> DevicePreviewMode {
@@ -4026,6 +4402,9 @@ impl App {
     }
 
     fn reconcile_device_preview(&mut self) {
+        if self.device_job_busy() || self.close_after_job {
+            return;
+        }
         let desired = self.desired_device_preview_mode();
         if desired != DevicePreviewMode::LiveDisplay && self.live_preview_dir.is_some() {
             if self
@@ -4435,17 +4814,18 @@ fn apply_pending_cover(
 
 impl Drop for App {
     fn drop(&mut self) {
+        self.queued_device_job = None;
+        self.device_job.take();
         self.stop_device_preview();
     }
 }
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if self.shutdown_requested.load(Ordering::SeqCst) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        self.poll();
+        if self.handle_close_request(ctx) {
             return;
         }
-        self.poll();
         self.handle_keyboard(ctx);
         let before = self.working.clone();
         self.show_top_bar(ctx);
@@ -4484,6 +4864,7 @@ impl eframe::App for App {
             });
         });
         self.capture_history(before, ctx);
+        self.show_reset_confirmation(ctx);
         self.reconcile_device_preview();
         let repaint_interval = if self.page == Page::StandbySettings
             && self.preview_mode == PreviewMode::Boot
@@ -4629,6 +5010,23 @@ fn widget_hit_tolerance(preview_width: f32) -> f32 {
         4.0 * 480.0 / preview_width
     } else {
         0.0
+    }
+}
+
+fn nudge_coordinate(value: f32, direction: i32, coarse: bool, snapping: bool, grid: f32) -> f32 {
+    if direction == 0 {
+        return value;
+    }
+    let steps = if coarse { 5.0 } else { 1.0 };
+    if snapping && grid.is_finite() && grid > 0.0 {
+        let line = if direction > 0 {
+            (value / grid).floor() + steps
+        } else {
+            (value / grid).ceil() - steps
+        };
+        line * grid
+    } else {
+        value + direction as f32 * steps
     }
 }
 
@@ -4977,7 +5375,94 @@ fn override_background_transparency_row(
     });
 }
 
-fn color_map_editor(ui: &mut egui::Ui, map: &mut Vec<config::ColorPoint>, owner_id: &str) {
+fn threshold_range(map: &[config::ColorPoint]) -> Option<[f32; 2]> {
+    let mut values = map
+        .iter()
+        .map(|point| point.value)
+        .filter(|value| value.is_finite());
+    let first = values.next()?;
+    Some(values.fold([first, first], |range, value| {
+        [range[0].min(value), range[1].max(value)]
+    }))
+}
+
+fn threshold_preview(
+    ui: &mut egui::Ui,
+    map: &[config::ColorPoint],
+    unit: &str,
+    reading: Option<f32>,
+) {
+    let Some([min, max]) = threshold_range(map) else {
+        ui.label("No finite thresholds; renderer uses its fallback color.");
+        return;
+    };
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width().clamp(1.0, 320.0), 18.0),
+        egui::Sense::hover(),
+    );
+    for column in 0..100 {
+        let t = column as f32 / 99.0;
+        let value = (min as f64 + (max as f64 - min as f64) * t as f64) as f32;
+        let color = config::interpolate_color(value, map);
+        let band = egui::Rect::from_min_max(
+            egui::pos2(
+                rect.left() + rect.width() * column as f32 / 100.0,
+                rect.top(),
+            ),
+            egui::pos2(
+                rect.left() + rect.width() * (column + 1) as f32 / 100.0,
+                rect.bottom(),
+            ),
+        );
+        ui.painter().rect_filled(
+            band,
+            0.0,
+            egui::Color32::from_rgb(color[0], color[1], color[2]),
+        );
+    }
+    ui.label(format!("{min} {unit} — {max} {unit}"));
+    if let Some(value) = reading.filter(|value| value.is_finite()) {
+        let position = if max > min {
+            (((value as f64 - min as f64) / (max as f64 - min as f64)).clamp(0.0, 1.0)) as f32
+        } else {
+            0.5
+        };
+        let x = rect.left() + rect.width() * position;
+        ui.painter().line_segment(
+            [
+                egui::pos2(x, rect.top() - 2.0),
+                egui::pos2(x, rect.bottom() + 2.0),
+            ],
+            egui::Stroke::new(3.0_f32, egui::Color32::BLACK),
+        );
+        ui.painter().line_segment(
+            [
+                egui::pos2(x, rect.top() - 2.0),
+                egui::pos2(x, rect.bottom() + 2.0),
+            ],
+            egui::Stroke::new(1.0_f32, egui::Color32::WHITE),
+        );
+        ui.label(format!(
+            "Current: {value:.2} {unit}{}",
+            if value < min || value > max {
+                " (outside threshold range)"
+            } else {
+                ""
+            }
+        ));
+    } else {
+        ui.label("Current reading unavailable / no preview source selected");
+    }
+}
+
+fn color_map_editor(
+    ui: &mut egui::Ui,
+    map: &mut Vec<config::ColorPoint>,
+    owner_id: &str,
+    unit: &str,
+    reading: Option<f32>,
+) {
+    threshold_preview(ui, map, unit, reading);
     let ids_key = ui.id().with((owner_id, "threshold-row-ids"));
     let mut row_ids = ui
         .ctx()
@@ -4992,7 +5477,11 @@ fn color_map_editor(ui: &mut egui::Ui, map: &mut Vec<config::ColorPoint>, owner_
     let mut remove = None;
     for (index, point) in map.iter_mut().enumerate() {
         ui.horizontal(|ui| {
-            ui.add(egui::DragValue::new(&mut point.value).speed(0.5));
+            ui.add(
+                egui::DragValue::new(&mut point.value)
+                    .speed(0.5)
+                    .suffix(format!(" {unit}")),
+            );
             rgb_editor(
                 ui,
                 (owner_id, "threshold", row_ids[index]),
@@ -6007,11 +6496,209 @@ fn standby_upload_args(
 
 #[cfg(test)]
 mod confirmed_gui_parity_tests {
-    use super::{
-        media_drop_target, standby_upload_args, standby_visibility_args, validate_media_file,
-        LiveTab, MediaDropTarget, Page, StandbyTab,
-    };
+    use super::*;
     use crate::config::MediaTransform;
+
+    fn editor(dir: &Path) -> App {
+        App::from_loaded_config(
+            dir.join("config.toml"),
+            Config::default(),
+            Arc::new(AtomicBool::new(false)),
+            (
+                ServiceManager::for_kind(service_manager::BackendKind::Unmanaged),
+                false,
+                false,
+                false,
+            ),
+            ProfileStore::in_directory(dir.join("profiles")),
+        )
+    }
+
+    #[test]
+    fn reset_is_undoable_and_apply_cannot_reinsert_the_old_background() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = editor(dir.path());
+        app.working.background.image_path = Some("old-image.png".into());
+        app.sync_background_source();
+        let original = app.working.clone();
+        app.reset_working_config();
+        assert_eq!(app.working, Config::default());
+        assert_eq!(app.background_source, BackgroundSource::SolidColor);
+        assert!(app.background_file_path.is_none());
+        assert!(!app.config_path.exists());
+        app.undo();
+        assert_eq!(app.working, original);
+        assert_eq!(app.background_file_path.as_deref(), Some("old-image.png"));
+        app.redo();
+        app.apply();
+        assert!(Config::load(&app.config_path)
+            .unwrap()
+            .background
+            .image_path
+            .is_none());
+    }
+
+    #[test]
+    fn keyboard_repeat_is_one_undo_and_modal_blocks_nudging() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = editor(dir.path());
+        app.page = Page::LiveDisplay;
+        app.live_tab = LiveTab::Overlay;
+        app.widget_snap.enabled = false;
+        app.selected_sensor = Some(app.working.widget_instances[0].id.clone());
+        let original = app.working.clone();
+        let ctx = egui::Context::default();
+        for (pressed, repeat) in [(true, false), (true, true), (false, false)] {
+            let mut input = egui::RawInput::default();
+            input.events.push(egui::Event::Key {
+                key: egui::Key::ArrowRight,
+                physical_key: None,
+                pressed,
+                repeat,
+                modifiers: egui::Modifiers::NONE,
+            });
+            let _ = ctx.run(input, |ctx| app.handle_keyboard(ctx));
+        }
+        assert_eq!(
+            app.working.widget_instances[0].transform.pan_x,
+            original.widget_instances[0].transform.pan_x + 2.0
+        );
+        assert_eq!(app.undo.len(), 1);
+        app.undo();
+        assert_eq!(app.working, original);
+        app.redo();
+        assert_ne!(app.working, original);
+        app.confirm_reset = true;
+        let before = app.working.clone();
+        let mut input = egui::RawInput::default();
+        input.events.push(egui::Event::Key {
+            key: egui::Key::ArrowLeft,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        let _ = ctx.run(input, |ctx| app.handle_keyboard(ctx));
+        assert_eq!(app.working, before);
+    }
+
+    #[test]
+    fn nudging_handles_off_grid_negative_and_untouched_coordinates() {
+        assert_eq!(nudge_coordinate(3.0, 1, false, false, 16.0), 4.0);
+        assert_eq!(nudge_coordinate(3.0, -1, true, false, 16.0), -2.0);
+        assert_eq!(nudge_coordinate(3.0, 1, false, true, 16.0), 16.0);
+        assert_eq!(nudge_coordinate(3.0, -1, false, true, 16.0), 0.0);
+        assert_eq!(nudge_coordinate(-3.0, -1, false, true, 16.0), -16.0);
+        assert_eq!(nudge_coordinate(-3.0, 1, true, true, 16.0), 64.0);
+        assert_eq!(nudge_coordinate(3.0, 0, false, true, 16.0), 3.0);
+    }
+
+    #[test]
+    fn reset_escape_does_not_change_config_or_preview_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = editor(dir.path());
+        app.working.rotation = 90.0;
+        app.confirm_reset = true;
+        let before = app.working.clone();
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input.events.push(egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        let _ = ctx.run(input, |ctx| app.show_reset_confirmation(ctx));
+        assert!(!app.confirm_reset);
+        assert_eq!(app.working, before);
+        assert!(app.undo.is_empty());
+    }
+
+    #[test]
+    fn device_job_waits_for_snapshot_and_rejects_another_submission() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = editor(dir.path());
+        app.device_status_pending = true;
+        app.run_short_device_command("First", vec!["--standby-brightness".into(), "50".into()]);
+        app.run_short_device_command("Second", vec!["--standby-brightness".into(), "80".into()]);
+        assert!(app.device_job.is_none());
+        let (label, args) = app.queued_device_job.as_ref().unwrap();
+        assert_eq!(label, "First");
+        assert_eq!(args, &["--standby-brightness", "50"]);
+        assert!(app.last_error.is_some());
+    }
+
+    #[test]
+    fn close_request_waits_for_device_writes_and_then_closes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = editor(dir.path());
+        let job = device_job::Job::start(
+            "/bin/sh".into(),
+            vec![
+                "-c".into(),
+                "printf 'TH420_DEVICE_JOB_READY_V1\\n'; read command; sleep 0.3".into(),
+            ],
+            "test".into(),
+            None,
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while job.phase() != device_job::Phase::Writing && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(job.phase(), device_job::Phase::Writing);
+        app.device_job = Some(job);
+        app.shutdown_requested.store(true, Ordering::SeqCst);
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            assert!(!app.handle_close_request(ctx))
+        });
+        assert!(output.viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .contains(&egui::ViewportCommand::CancelClose));
+        assert!(app.close_after_job);
+        while app.device_job_busy() && Instant::now() < deadline {
+            app.poll_device_job();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!app.device_job_busy());
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            assert!(app.handle_close_request(ctx))
+        });
+        assert!(output.viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .contains(&egui::ViewportCommand::Close));
+    }
+
+    #[test]
+    fn threshold_preview_handles_degenerate_and_invalid_readings() {
+        let ctx = egui::Context::default();
+        for values in [
+            vec![],
+            vec![30.0],
+            vec![30.0, 30.0],
+            vec![f32::NAN],
+            vec![10.0, 50.0],
+        ] {
+            let map: Vec<_> = values
+                .into_iter()
+                .map(|value| config::ColorPoint {
+                    value,
+                    color: [200, 100, 50],
+                })
+                .collect();
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    for reading in [None, Some(f32::NAN), Some(-5.0), Some(100.0)] {
+                        threshold_preview(ui, &map, "°C", reading);
+                    }
+                });
+            });
+            if map.iter().all(|point| !point.value.is_finite()) {
+                assert!(threshold_range(&map).is_none());
+            }
+        }
+    }
 
     #[test]
     fn drop_routing_follows_only_the_active_editor() {

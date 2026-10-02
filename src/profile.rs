@@ -11,6 +11,10 @@ pub struct ProfileStore {
 }
 
 impl ProfileStore {
+    #[cfg(test)]
+    pub(crate) fn in_directory(dir: PathBuf) -> Self {
+        Self { dir }
+    }
     pub fn new() -> Self {
         let mut dir = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
         dir.push("th420-display");

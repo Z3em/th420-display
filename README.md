@@ -116,6 +116,21 @@ Boot and Standby preview their selected media, and other pages leave the switch
 idle. Live preview uses a private temporary configuration and does not apply or
 save those edits. Turning preview off resumes a daemon that the GUI paused.
 
+Device uploads and settings commands run as background jobs with status above
+Display Preview. Preparation can be cancelled; after device writes begin,
+Cancel is disabled and closing the GUI waits for completion and daemon
+restoration. A job pauses a running daemon and resumes only the instance it
+paused. Turn device preview off before starting a job. Errors and bounded helper
+output are available in Diagnostics; a failed write is not automatically retried.
+
+On the widget tab, arrow keys nudge the selected widget by 1 pixel, or 5 pixels
+with Shift. With snapping enabled, they move to the next grid line, or five
+grid lines with Shift. A held-key gesture is one undoable action. Threshold
+editors show the interpolated gradient, source units, and current-reading marker;
+template preview sources are optional and do not change runtime configuration.
+Reset working configuration asks for confirmation, is undoable, and requires
+Apply to save. An active Live device preview immediately reflects that reset.
+
 Drop one local media file onto Live Background, Boot, or Standby to select it;
 the Browse buttons remain available. Boot requires a GIF. In Standby, device
 coolant-text visibility defaults to **Keep unchanged**, and text color is only

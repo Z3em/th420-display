@@ -1,6 +1,7 @@
 mod config;
 mod device;
 mod instance;
+mod job_protocol;
 mod renderer;
 mod sensors;
 
@@ -96,6 +97,10 @@ struct Cli {
     /// Stream a temporary live configuration without owning the daemon instance.
     #[arg(long, requires = "config")]
     preview_live: bool,
+
+    /// Internal GUI preparation/write handshake; stdin must authorize writes.
+    #[arg(long, hide = true)]
+    gui_device_job: bool,
 
     /// Print device coolant temperature and pump RPM, then exit.
     #[arg(long)]
@@ -355,6 +360,22 @@ fn decode_boot_gif(
 }
 
 fn validate_cli(cli: &Cli) -> Result<()> {
+    if cli.gui_device_job
+        && (cli.status
+            || cli.inspect_boot.is_some()
+            || cli.preview_live
+            || cli.replace_existing.is_some()
+            || cli.daemon_control.is_some()
+            || cli.play_live_gif.is_some()
+            || !cli.play_live_frames.is_empty()
+            || !(cli.upload_boot.is_some()
+                || cli.upload_standby.is_some()
+                || cli.standby_brightness.is_some()
+                || cli.pump_temp_overlay.is_some()
+                || cli.pump_temp_color.is_some()))
+    {
+        bail!("--gui-device-job requires a supported one-shot write operation");
+    }
     if cli.preview_live && cli.config.is_none() {
         bail!("--preview-live requires --config");
     }
@@ -514,6 +535,7 @@ fn main() -> Result<()> {
             bail!("boot container exceeds the 10 MB vendor-app limit");
         }
 
+        job_protocol::wait_for_gui(cli.gui_device_job)?;
         let _device_guard = DeviceGuard::acquire().map_err(anyhow::Error::msg)?;
         println!("Opening Thermaltake TH420 V2...");
         let mut dev = device::Device::open()?;
@@ -609,6 +631,7 @@ fn main() -> Result<()> {
         };
         let color = cli.pump_temp_color.as_deref().map(parse_rgb).transpose()?;
 
+        job_protocol::wait_for_gui(cli.gui_device_job)?;
         let _device_guard = DeviceGuard::acquire().map_err(anyhow::Error::msg)?;
         println!("Opening Thermaltake TH420 V2...");
         let mut dev = device::Device::open()?;
@@ -808,6 +831,38 @@ fn main() -> Result<()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn gui_write_gate_only_accepts_supported_one_shot_operations() {
+        for args in [
+            vec!["th420-display", "--gui-device-job"],
+            vec!["th420-display", "--gui-device-job", "--status"],
+            vec![
+                "th420-display",
+                "--gui-device-job",
+                "--play-live-gif",
+                "file.gif",
+            ],
+        ] {
+            assert!(validate_cli(&Cli::try_parse_from(args).unwrap()).is_err());
+        }
+        for args in [
+            vec![
+                "th420-display",
+                "--gui-device-job",
+                "--standby-brightness",
+                "50",
+            ],
+            vec![
+                "th420-display",
+                "--gui-device-job",
+                "--upload-boot",
+                "file.gif",
+            ],
+        ] {
+            assert!(validate_cli(&Cli::try_parse_from(args).unwrap()).is_ok());
+        }
+    }
+
     fn cli() -> Cli {
         Cli {
             replace_existing: None,
@@ -815,6 +870,7 @@ mod tests {
             interval: 800,
             config: None,
             preview_live: false,
+            gui_device_job: false,
             status: false,
             upload_standby: None,
             standby_brightness: None,
