@@ -1,0 +1,94 @@
+{
+  "cpu": "AMD Ryzen 9 9950X3D 16-Core Processor",
+  "platform": "Linux x86_64",
+  "python": "3.14.8",
+  "cpu_affinity": [
+    0
+  ],
+  "frames": 23,
+  "frame_bytes": 691200,
+  "raw_bytes": 15897600,
+  "raw_mib": 15.1611328125,
+  "corpus_sha256": "e58c4be8760d11ee011cb0e70c140f2d4ed08c4c5e6e23146013306d32b18637",
+  "compression_rounds": 10,
+  "decompression_rounds": 200,
+  "method": "Single thread; independent frames; reusable output buffers and Zstd contexts; ctypes call overhead included; exact round-trips verified; no disk I/O timed; randomized codec order each round; no dictionaries or frame deltas.",
+  "results": [
+    {
+      "codec": "LZ4 default",
+      "version": "1.10.0",
+      "compressed_bytes": 7112862,
+      "compressed_mib": 6.783353805541992,
+      "compression_ratio": 2.235049688859421,
+      "savings_percent": 55.25826539855072,
+      "compression_per_frame": {
+        "median_ms": 0.50445,
+        "p95_ms": 0.652887,
+        "max_ms": 0.723127
+      },
+      "decompression_per_frame": {
+        "median_ms": 0.121611,
+        "p95_ms": 0.177902,
+        "max_ms": 0.368874
+      },
+      "compression_whole_clip_median_ms": 11.9224165
+    },
+    {
+      "codec": "LZ4 HC 9",
+      "version": "1.10.0",
+      "compressed_bytes": 6054855,
+      "compressed_mib": 5.774359703063965,
+      "compression_ratio": 2.625595493203388,
+      "savings_percent": 61.91340202294686,
+      "compression_per_frame": {
+        "median_ms": 8.285264,
+        "p95_ms": 9.017052,
+        "max_ms": 9.179493
+      },
+      "decompression_per_frame": {
+        "median_ms": 0.114651,
+        "p95_ms": 0.170012,
+        "max_ms": 0.285503
+      },
+      "compression_whole_clip_median_ms": 186.089161
+    },
+    {
+      "codec": "Zstd 1",
+      "version": "1.5.7",
+      "compressed_bytes": 5982964,
+      "compressed_mib": 5.705799102783203,
+      "compression_ratio": 2.657144519004293,
+      "savings_percent": 62.365614935587764,
+      "compression_per_frame": {
+        "median_ms": 0.8404735,
+        "p95_ms": 1.0103,
+        "max_ms": 1.059521
+      },
+      "decompression_per_frame": {
+        "median_ms": 0.3061835,
+        "p95_ms": 0.437264,
+        "max_ms": 0.518806
+      },
+      "compression_whole_clip_median_ms": 19.524248
+    },
+    {
+      "codec": "Zstd 3",
+      "version": "1.5.7",
+      "compressed_bytes": 5644106,
+      "compressed_mib": 5.382638931274414,
+      "compression_ratio": 2.816672826484832,
+      "savings_percent": 64.49711906199678,
+      "compression_per_frame": {
+        "median_ms": 1.3387785,
+        "p95_ms": 1.544036,
+        "max_ms": 1.698247
+      },
+      "decompression_per_frame": {
+        "median_ms": 0.317528,
+        "p95_ms": 0.451915,
+        "max_ms": 0.545796
+      },
+      "compression_whole_clip_median_ms": 30.597901
+    }
+  ]
+}

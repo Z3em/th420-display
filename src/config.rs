@@ -623,9 +623,30 @@ fn make_sensor(
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
+pub const MIN_BACKGROUND_CACHE_MIB: u32 = 1;
+pub const MAX_BACKGROUND_CACHE_MIB: u32 = 1024;
+pub const DEFAULT_BACKGROUND_CACHE_MIB: u32 = 32;
+
+fn default_background_cache_size_mib() -> u32 {
+    DEFAULT_BACKGROUND_CACHE_MIB
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BackgroundCacheCompression {
+    #[default]
+    Raw,
+    #[serde(rename = "lz4_hc9")]
+    Lz4Hc9,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Config {
     pub rotation: f32,
+    #[serde(default)]
+    pub background_cache_compression: BackgroundCacheCompression,
+    #[serde(default = "default_background_cache_size_mib")]
+    pub background_cache_size_mib: u32,
     #[serde(default = "default_true")]
     pub overlay_enabled: bool,
     pub background: BackgroundConfig,
@@ -682,6 +703,8 @@ impl Default for Config {
         let cpu_label = default_cpu_label();
         let mut config = Self {
             rotation: 180.0,
+            background_cache_compression: BackgroundCacheCompression::default(),
+            background_cache_size_mib: DEFAULT_BACKGROUND_CACHE_MIB,
             overlay_enabled: true,
             background: BackgroundConfig::default(),
             layout: LayoutConfig::default(),
@@ -771,6 +794,9 @@ impl Config {
         let text = fs::read_to_string(path)?;
         let source: toml::Value = toml::from_str(&text).map_err(|e| anyhow::anyhow!(e))?;
         let mut config: Self = toml::from_str(&text).map_err(|e| anyhow::anyhow!(e))?;
+        config.background_cache_size_mib = config
+            .background_cache_size_mib
+            .clamp(MIN_BACKGROUND_CACHE_MIB, MAX_BACKGROUND_CACHE_MIB);
         config.migrate_sensors();
         config.migrate_background_transforms(&source);
         // Widget migration is intentionally in-memory. The new representation is
@@ -1031,6 +1057,35 @@ mod tests {
     }
 
     // ── interpolate_color ─────────────────────────────────────────────────────
+
+    #[test]
+    fn background_cache_compression_defaults_to_raw_and_round_trips() {
+        let mut value = toml::Value::try_from(Config::default()).unwrap();
+        value
+            .as_table_mut()
+            .unwrap()
+            .remove("background_cache_compression");
+        value
+            .as_table_mut()
+            .unwrap()
+            .remove("background_cache_size_mib");
+        let legacy: Config = toml::from_str(&toml::to_string(&value).unwrap()).unwrap();
+        assert_eq!(
+            legacy.background_cache_compression,
+            BackgroundCacheCompression::Raw
+        );
+        assert_eq!(
+            legacy.background_cache_size_mib,
+            DEFAULT_BACKGROUND_CACHE_MIB
+        );
+        let mut compressed = legacy;
+        compressed.background_cache_compression = BackgroundCacheCompression::Lz4Hc9;
+        compressed.background_cache_size_mib = 64;
+        let text = toml::to_string(&compressed).unwrap();
+        assert!(text.contains("background_cache_compression = \"lz4_hc9\""));
+        let loaded: Config = toml::from_str(&text).unwrap();
+        assert_eq!(loaded, compressed);
+    }
 
     #[test]
     fn interpolate_empty_map_returns_default_gray() {

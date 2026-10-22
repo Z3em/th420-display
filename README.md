@@ -55,7 +55,7 @@ direct daemon controls but do not offer automatic service/autostart management.
 
 ## Build from source
 
-**Requirements:** Rust toolchain, `hidapi` headers (`libhidapi-dev` / `hidapi-devel`)
+**Requirements:** Rust toolchain, a C compiler (for bundled LZ4), `hidapi` headers (`libhidapi-dev` / `hidapi-devel`)
 
 ```bash
 # Daemon only
@@ -98,7 +98,7 @@ make appimage
 - **Background image** — browse for any PNG/JPG, choose Cover / Contain / Stretch fit and darken level
 - **Layout presets** — Classic, Grid 2×3, Big Top, Custom (with per-sensor position and font size)
 - **Per-sensor config** — enable/disable, custom label, label color, value color gradient with thresholds
-- **Live preview** — 480×480 preview updates every 800 ms with real sensor values
+- **Live preview** — 480×480 animated backgrounds with independently refreshed sensor values
 - **Config hot-reload** — daemon picks up changes instantly on every save
 
 Coolant and pump telemetry is live only while the daemon is running. The GUI
@@ -115,6 +115,32 @@ Preview follows the active page: Live Display streams the current unsaved edits,
 Boot and Standby preview their selected media, and other pages leave the switch
 idle. Live preview uses a private temporary configuration and does not apply or
 save those edits. Turning preview off resumes a daemon that the GUI paused.
+
+Live backgrounds are prepared asynchronously at 480×480. In **Settings → Live
+background cache → Compression**, choose **Raw RGB** (the default) or lossless
+**LZ4 HC** (level 9). Use Apply to save the setting; profiles and unsaved Live
+Display previews also carry it. The top-level TOML field is
+`background_cache_compression = "raw"` or `"lz4_hc9"`.
+The adjacent **Cache size** control accepts 1–1024 MiB and defaults to 32 MiB
+(`background_cache_size_mib = 32` in TOML).
+
+A complete loop is cached when its stored frame payloads fit the selected budget.
+At the default 32 MiB, raw RGB fits up to 48 frames; LZ4 HC can fit longer loops, depending on content.
+Frames that do not become smaller are retained as raw RGB. HC compression runs
+only during preparation. Cached playback decodes changed frames into reusable
+480×480 buffers, then draws current sensor overlays and encodes the USB JPEG.
+
+Larger clips use an eight-frame raw prepared queue instead. Once preparation
+exceeds the budget, the cached prefix is decoded once into that queue and later
+frames/loops bypass compression. The budget applies to each GUI/daemon playback
+instance; queue/current-frame buffers, codec buffers, and decoder/transformation
+working memory are additional. Native-resolution frames and finished JPEGs are
+not retained in the playback cache.
+
+Changes to the source file, background settings, compression mode, or cache
+size rebuild the cache; sensor updates do not. GIF delays are preserved, and video output is
+normalized to 24 FPS. The previous prepared background stays visible while a
+replacement is prepared.
 
 Device uploads and settings commands run as background jobs with status above
 Display Preview. Preparation can be cancelled; after device writes begin,

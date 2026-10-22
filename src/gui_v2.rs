@@ -1592,11 +1592,16 @@ impl App {
             });
     }
 
-    fn update_preview_texture(&mut self, ctx: &egui::Context) {
-        let refresh_interval = if self.page == Page::StandbySettings
+    fn animated_preview_active(&self) -> bool {
+        (self.page == Page::StandbySettings
             && self.preview_mode == PreviewMode::Boot
-            && self.boot_animation.is_some()
-        {
+            && self.boot_animation.is_some())
+            || (self.page == Page::LiveDisplay
+                && self.renderer.animation_frame_interval().is_some())
+    }
+
+    fn update_preview_texture(&mut self, ctx: &egui::Context) {
+        let refresh_interval = if self.animated_preview_active() {
             Duration::from_millis(16)
         } else {
             Duration::from_millis(50)
@@ -3905,6 +3910,40 @@ impl App {
         ui.collapsing("Profiles", |ui| self.show_profiles(ui));
         ui.add_space(8.0);
         ui.group(|ui| {
+            ui.label(egui::RichText::new("Live background cache").strong());
+            egui::ComboBox::from_label("Compression")
+                .selected_text(match self.working.background_cache_compression {
+                    config::BackgroundCacheCompression::Raw => "Raw RGB (fastest playback)",
+                    config::BackgroundCacheCompression::Lz4Hc9 => "LZ4 HC (less memory)",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut self.working.background_cache_compression,
+                        config::BackgroundCacheCompression::Raw,
+                        "Raw RGB (fastest playback)",
+                    );
+                    ui.selectable_value(
+                        &mut self.working.background_cache_compression,
+                        config::BackgroundCacheCompression::Lz4Hc9,
+                        "LZ4 HC (less memory)",
+                    );
+                });
+            ui.horizontal(|ui| {
+                ui.label("Cache size");
+                ui.add(
+                    egui::DragValue::new(&mut self.working.background_cache_size_mib)
+                        .range(config::MIN_BACKGROUND_CACHE_MIB..=config::MAX_BACKGROUND_CACHE_MIB)
+                        .suffix(" MiB")
+                        .speed(1.0),
+                );
+            });
+            ui.label(
+                "Frame storage limit per playback instance; working buffers use additional memory.",
+            );
+            ui.label("Lossless compression fits longer loops; preparation takes longer.");
+        });
+        ui.add_space(8.0);
+        ui.group(|ui| {
             ui.label(egui::RichText::new("Device").strong());
             egui::ComboBox::from_label("Orientation")
                 .selected_text(format!("{:.0}°", self.working.rotation))
@@ -4866,10 +4905,7 @@ impl eframe::App for App {
         self.capture_history(before, ctx);
         self.show_reset_confirmation(ctx);
         self.reconcile_device_preview();
-        let repaint_interval = if self.page == Page::StandbySettings
-            && self.preview_mode == PreviewMode::Boot
-            && self.boot_animation.is_some()
-        {
+        let repaint_interval = if self.animated_preview_active() {
             Duration::from_millis(16)
         } else {
             Duration::from_millis(150)
@@ -6182,6 +6218,8 @@ mod device_preview_mode_tests {
         committed.save(&committed_path).unwrap();
         let mut working = committed.clone();
         working.rotation = 37.5;
+        working.background_cache_compression = crate::config::BackgroundCacheCompression::Lz4Hc9;
+        working.background_cache_size_mib = 64;
         let snapshot = live_preview_config(
             &working,
             BackgroundSource::File,
@@ -6190,6 +6228,18 @@ mod device_preview_mode_tests {
         );
         write_live_preview_config(&snapshot_path, &snapshot).unwrap();
         assert_eq!(Config::load(&snapshot_path).unwrap().rotation, 37.5);
+        assert_eq!(
+            Config::load(&snapshot_path)
+                .unwrap()
+                .background_cache_size_mib,
+            64
+        );
+        assert_eq!(
+            Config::load(&snapshot_path)
+                .unwrap()
+                .background_cache_compression,
+            crate::config::BackgroundCacheCompression::Lz4Hc9
+        );
         assert_eq!(
             Config::load(&snapshot_path)
                 .unwrap()

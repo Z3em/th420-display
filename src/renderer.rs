@@ -4,16 +4,19 @@ use image::{imageops, AnimationDecoder, Rgb, RgbImage, Rgba, RgbaImage};
 use imageproc::drawing::{draw_filled_circle_mut, draw_line_segment_mut, draw_text_mut};
 use imageproc::geometric_transformations::{rotate_about_center, Interpolation};
 use std::fs::File;
-use std::io::{BufReader, Cursor, Read};
+use std::io::BufReader;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
-use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::process::Command;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::config::{
     effective_label_offset_y, BackgroundConfig, Config, ImageFit, MediaTransform, Transform2D,
 };
 use crate::sensors::SensorValues;
+
+#[path = "background_cache.rs"]
+mod background_cache;
 
 const FONT_BYTES: &[u8] = include_bytes!("../assets/NotoSans-Bold.ttf");
 
@@ -434,34 +437,6 @@ pub fn arc_pointer_angle(
     (dx * dx + dy * dy >= dead_zone_radius.max(0.0).powi(2)).then(|| dy.atan2(dx).to_degrees())
 }
 
-#[derive(Clone, Debug, PartialEq)]
-struct BackgroundGeometryKey {
-    fit: ImageFit,
-    zoom: f32,
-    stretch_x: f32,
-    stretch_y: f32,
-    rotation: f32,
-    background_color: [u8; 3],
-}
-
-enum AnimatedSource {
-    Static {
-        image: RgbImage,
-        delivered: bool,
-    },
-    Gif {
-        frames: Vec<(RgbImage, Duration)>,
-        total: Duration,
-        started: Instant,
-        current: usize,
-    },
-    Ffmpeg {
-        child: Child,
-        frames: Receiver<RgbImage>,
-        current: Option<RgbImage>,
-    },
-}
-
 pub struct TimedAnimation {
     frames: Vec<(RgbImage, Duration)>,
     dimensions: Vec<(u32, u32)>,
@@ -545,224 +520,23 @@ impl TimedAnimation {
     }
 }
 
-impl AnimatedSource {
-    fn frame_interval(&self) -> Option<Duration> {
-        match self {
-            Self::Static { .. } => None,
-            Self::Gif {
-                frames, current, ..
-            } => Some(
-                frames
-                    .get(*current)
-                    .or_else(|| frames.first())
-                    .map(|(_, delay)| *delay)
-                    .unwrap_or(Duration::from_millis(100))
-                    .max(Duration::from_secs_f64(1.0 / MAX_DEVICE_FRAME_RATE)),
-            ),
-            // FFmpeg preserves source timing with -re. Poll often enough for
-            // smooth video without exceeding the hardware-tested 24 FPS.
-            Self::Ffmpeg { .. } => Some(Duration::from_secs_f64(1.0 / MAX_DEVICE_FRAME_RATE)),
-        }
-    }
-
-    fn open(path: &str) -> Result<Self, String> {
-        if Path::new(path)
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("gif"))
-        {
-            let decoder =
-                GifDecoder::new(BufReader::new(File::open(path).map_err(|e| e.to_string())?))
-                    .map_err(|e| e.to_string())?;
-            let mut total = Duration::ZERO;
-            let frames = decoder
-                .into_frames()
-                .collect_frames()
-                .map_err(|e| e.to_string())?
-                .into_iter()
-                .map(|frame| {
-                    let (numerator, denominator) = frame.delay().numer_denom_ms();
-                    let delay = if denominator == 0 {
-                        Duration::from_millis(100)
-                    } else {
-                        Duration::from_secs_f64(
-                            f64::from(numerator) / f64::from(denominator) / 1000.0,
-                        )
-                    }
-                    .max(Duration::from_millis(10));
-                    total += delay;
-                    (
-                        image::DynamicImage::ImageRgba8(frame.into_buffer()).into_rgb8(),
-                        delay,
-                    )
-                })
-                .collect::<Vec<_>>();
-            if frames.is_empty() {
-                return Err("animated image contains no frames".into());
-            }
-            return Ok(Self::Gif {
-                frames,
-                total,
-                started: Instant::now(),
-                current: usize::MAX,
-            });
-        }
-        if let Ok(image) = image::open(path) {
-            return Ok(Self::Static {
-                image: image.into_rgb8(),
-                delivered: false,
-            });
-        }
-        Self::open_ffmpeg(path)
-    }
-
-    fn open_ffmpeg(path: &str) -> Result<Self, String> {
-        let mut child = Command::new("ffmpeg")
-            .args([
-                "-v",
-                "error",
-                "-stream_loop",
-                "-1",
-                "-re",
-                "-i",
-                path,
-                "-f",
-                "image2pipe",
-                "-vcodec",
-                "mjpeg",
-                "-q:v",
-                "2",
-                "pipe:1",
-            ])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(ffmpeg_start_error)?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| "FFmpeg stdout unavailable".to_string())?;
-        let (tx, frames) = mpsc::sync_channel(1);
-        std::thread::spawn(move || read_mjpeg_frames(stdout, tx));
-        Ok(Self::Ffmpeg {
-            child,
-            frames,
-            current: None,
-        })
-    }
-
-    fn next_frame(&mut self) -> Option<RgbImage> {
-        match self {
-            Self::Static { image, delivered } => {
-                if *delivered {
-                    None
-                } else {
-                    *delivered = true;
-                    Some(image.clone())
-                }
-            }
-            Self::Gif {
-                frames,
-                total,
-                started,
-                current,
-            } => {
-                let elapsed = started.elapsed().as_secs_f64() % total.as_secs_f64();
-                let mut accumulated = 0.0;
-                let index = frames
-                    .iter()
-                    .position(|(_, delay)| {
-                        accumulated += delay.as_secs_f64();
-                        elapsed < accumulated
-                    })
-                    .unwrap_or(frames.len() - 1);
-                if index == *current {
-                    None
-                } else {
-                    *current = index;
-                    Some(frames[index].0.clone())
-                }
-            }
-            Self::Ffmpeg {
-                frames, current, ..
-            } => {
-                let mut newest = None;
-                while let Ok(frame) = frames.try_recv() {
-                    newest = Some(frame);
-                }
-                if let Some(frame) = newest {
-                    *current = Some(frame.clone());
-                    Some(frame)
-                } else {
-                    None
-                }
-            }
-        }
-    }
-}
-
-impl Drop for AnimatedSource {
-    fn drop(&mut self) {
-        if let Self::Ffmpeg { child, .. } = self {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
-}
-
-fn read_mjpeg_frames(mut reader: impl Read, tx: SyncSender<RgbImage>) {
-    let mut pending = Vec::new();
-    let mut chunk = [0u8; 64 * 1024];
-    while let Ok(count) = reader.read(&mut chunk) {
-        if count == 0 {
-            break;
-        }
-        pending.extend_from_slice(&chunk[..count]);
-        while let Some(end) = pending.windows(2).position(|bytes| bytes == [0xff, 0xd9]) {
-            let jpeg = pending.drain(..end + 2).collect::<Vec<_>>();
-            if let Ok(image) = image::load_from_memory(&jpeg) {
-                let _ = tx.try_send(image.into_rgb8());
-            }
-        }
-    }
-}
-
-impl From<&BackgroundConfig> for BackgroundGeometryKey {
-    fn from(config: &BackgroundConfig) -> Self {
-        Self {
-            fit: config.fit.clone(),
-            zoom: config.zoom,
-            stretch_x: config.stretch_x,
-            stretch_y: config.stretch_y,
-            rotation: config.rotation,
-            background_color: config.background_color,
-        }
-    }
-}
-
 pub struct Renderer {
     font_bytes: Vec<u8>,
-    /// Decoded source media, independent of presentation transforms.
-    bg_source: Option<(String, AnimatedSource)>,
-    bg_source_cache: Option<(String, RgbImage)>,
-    /// Scaled and rotated source, independent of pan and post-processing.
-    bg_geometry_cache: Option<(BackgroundGeometryKey, RgbImage)>,
-    /// Cached background image together with all transformation parameters.
-    bg_cache: Option<(BackgroundConfig, RgbImage)>,
+    bg_player: Option<background_cache::BackgroundPlayer>,
+    bg_key: Option<background_cache::Key>,
+    /// Prepared background only; live sensor overlays are drawn afterward.
+    bg_cache: Option<(BackgroundConfig, Arc<RgbImage>)>,
     background_error: Option<String>,
-    background_failed_path: Option<String>,
 }
 
 impl Renderer {
     pub fn new() -> Self {
         Self {
             font_bytes: FONT_BYTES.to_vec(),
-            bg_source: None,
-            bg_source_cache: None,
-            bg_geometry_cache: None,
+            bg_player: None,
+            bg_key: None,
             bg_cache: None,
             background_error: None,
-            background_failed_path: None,
         }
     }
 
@@ -783,100 +557,65 @@ impl Renderer {
     #[allow(dead_code)]
     pub fn render(&mut self, config: &Config, v: &SensorValues) -> Vec<u8> {
         let img = self.render_image(config, v);
-        let mut buf = Cursor::new(Vec::new());
-        img.write_to(&mut buf, image::ImageFormat::Jpeg)
+        let mut encoded = Vec::new();
+        let mut encoder = jpeg_encoder::Encoder::new(&mut encoded, 75);
+        // Match the vendor's 4:2:0 format to reduce USB packets per frame.
+        encoder.set_sampling_factor(jpeg_encoder::SamplingFactor::F_2_2);
+        encoder
+            .encode(
+                img.as_raw(),
+                W as u16,
+                H as u16,
+                jpeg_encoder::ColorType::Rgb,
+            )
             .expect("jpeg encode failed");
-        buf.into_inner()
+        encoded
     }
 
     /// Recommended device refresh cadence for the active animated background.
     /// Sensor collection remains independently controlled by the daemon interval.
     pub fn animation_frame_interval(&self) -> Option<Duration> {
-        self.bg_source
-            .as_ref()
-            .and_then(|(_, source)| source.frame_interval())
+        self.bg_player.as_ref().and_then(|player| player.interval())
     }
 
     pub fn background_source_dimensions(&self, path: &str) -> Option<(u32, u32)> {
-        self.bg_source_cache
+        self.bg_key.as_ref()?;
+        self.bg_cache
             .as_ref()
-            .filter(|(cached_path, _)| cached_path == path)
-            .map(|(_, image)| (image.width(), image.height()))
+            .filter(|(background, _)| background.image_path.as_deref() == Some(path))?;
+        self.bg_player.as_ref()?.dimensions
     }
 
     fn update_bg_cache(&mut self, config: &Config) {
-        if !config.background.enabled {
-            self.bg_source = None;
-            self.bg_cache = None;
-            return;
-        }
-
-        let Some(path) = config.background.image_path.as_deref() else {
-            self.bg_source = None;
-            self.bg_source_cache = None;
-            self.bg_geometry_cache = None;
-            self.bg_cache = None;
-            return;
-        };
-        let source_matches = self
-            .bg_source
-            .as_ref()
-            .is_some_and(|(cached_path, _)| cached_path == path);
-        if !source_matches {
-            if self.background_failed_path.as_deref() == Some(path) {
-                return;
-            }
-            match AnimatedSource::open(path) {
-                Ok(source) => {
-                    self.bg_source = Some((path.to_string(), source));
-                    self.bg_source_cache = None;
-                    self.background_error = None;
-                    self.background_failed_path = None;
-                }
-                Err(error) => {
-                    self.background_error = Some(error);
-                    self.background_failed_path = Some(path.to_string());
-                    return;
+        if !config.background.enabled || config.background.image_path.is_none() {
+            if self.bg_key.is_some() {
+                if let Some(player) = &mut self.bg_player {
+                    player.clear();
                 }
             }
-            self.bg_geometry_cache = None;
+            self.bg_key = None;
             self.bg_cache = None;
-        }
-
-        let frame_changed = self
-            .bg_source
-            .as_mut()
-            .and_then(|(_, source)| source.next_frame())
-            .map(|frame| {
-                self.bg_source_cache = Some((path.to_string(), frame));
-                self.bg_geometry_cache = None;
-                self.bg_cache = None;
-            })
-            .is_some();
-        if !frame_changed
-            && self.bg_cache.as_ref().map(|(background, _)| background) == Some(&config.background)
-        {
+            self.background_error = None;
             return;
         }
-
-        let geometry_key = BackgroundGeometryKey::from(&config.background);
-        let geometry_matches = self
-            .bg_geometry_cache
-            .as_ref()
-            .is_some_and(|(cached_key, _)| cached_key == &geometry_key);
-        if !geometry_matches {
-            self.bg_geometry_cache = self.bg_source_cache.as_ref().and_then(|(_, source)| {
-                prepare_background_geometry(source, &config.background)
-                    .map(|image| (geometry_key, image))
-            });
+        let key = background_cache::Key::new(&config.background)
+            .with_compression(config.background_cache_compression)
+            .with_size_mib(config.background_cache_size_mib);
+        if self.bg_key.as_ref() != Some(&key) {
+            self.bg_player
+                .get_or_insert_with(background_cache::BackgroundPlayer::new)
+                .request(key.clone());
+            self.bg_key = Some(key);
+            self.background_error = None;
         }
-
-        self.bg_cache = self.bg_geometry_cache.as_ref().map(|(_, prepared)| {
-            (
-                config.background.clone(),
-                compose_background_image(prepared, &config.background),
-            )
-        });
+        let player = self.bg_player.as_mut().unwrap();
+        if let Some(frame) = player.next_frame(Instant::now()) {
+            self.bg_cache = Some((config.background.clone(), frame));
+        }
+        if let Some(error) = player.error.take() {
+            self.bg_cache = None;
+            self.background_error = Some(error);
+        }
     }
 
     pub fn take_background_error(&mut self) -> Option<String> {
@@ -999,7 +738,7 @@ impl Renderer {
         // ── Base layer ────────────────────────────────────────────────────────
         let mut img = if config.background.enabled {
             if let Some((_, ref bg)) = self.bg_cache {
-                bg.clone()
+                bg.as_ref().clone()
             } else {
                 RgbImage::from_pixel(W, H, BG)
             }
@@ -2193,41 +1932,113 @@ mod tests {
         assert_eq!(rendered.get_pixel(240, 240), &Rgb([200, 100, 50]));
     }
 
+    fn wait_for_background(renderer: &mut Renderer, config: &Config) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            renderer.update_bg_cache(config);
+            if renderer
+                .bg_cache
+                .as_ref()
+                .is_some_and(|(key, _)| key == &config.background)
+                && renderer.bg_player.as_ref().unwrap().dimensions.is_some()
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "background preparation timed out: {:?}",
+                renderer.background_error
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
     #[test]
-    fn background_cache_invalidates_only_the_affected_layer() {
+    fn failed_replacement_clears_the_previous_background() {
         let path = std::env::temp_dir().join(format!(
-            "th420-transform-cache-{}-{:?}.png",
+            "th420-cache-error-{}-{:?}.png",
             std::process::id(),
             std::thread::current().id()
         ));
-        RgbImage::from_pixel(24, 12, Rgb([90, 120, 150]))
+        RgbImage::from_pixel(16, 8, Rgb([100, 0, 0]))
             .save(&path)
             .unwrap();
+        let mut config = Config::default();
+        config.background.image_path = Some(path.to_string_lossy().into_owned());
+        let mut renderer = Renderer::new();
+        wait_for_background(&mut renderer, &config);
+        config.background.image_path = Some(
+            path.with_extension("missing.gif")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while renderer.background_error.is_none() {
+            renderer.update_bg_cache(&config);
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(renderer.bg_cache.is_none());
+        assert!(renderer
+            .background_source_dimensions(path.to_str().unwrap())
+            .is_none());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn prepared_background_invalidates_on_visual_edits_but_not_sensor_edits() {
+        let path = std::env::temp_dir().join(format!(
+            "th420-prepared-{}-{:?}.png",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let source = RgbImage::from_pixel(24, 12, Rgb([90, 120, 150]));
+        source.save(&path).unwrap();
         let mut config = Config::default();
         config.background.image_path = Some(path.to_string_lossy().into_owned());
         config.background.fit = ImageFit::Native;
         config.background.overlay_alpha = 0;
         let mut renderer = Renderer::new();
-
-        renderer.update_bg_cache(&config);
-        let original_geometry = renderer.bg_geometry_cache.as_ref().unwrap().clone();
-        let original_composed = renderer.bg_cache.as_ref().unwrap().1.clone();
-
-        config.background.pan_x = 40.0;
-        renderer.update_bg_cache(&config);
+        wait_for_background(&mut renderer, &config);
         assert_eq!(
-            renderer.bg_geometry_cache.as_ref().unwrap(),
-            &original_geometry
+            renderer.background_source_dimensions(path.to_str().unwrap()),
+            Some((24, 12))
         );
-        assert_ne!(renderer.bg_cache.as_ref().unwrap().1, original_composed);
-
-        config.background.background_color = [1, 2, 3];
+        let original = Arc::clone(&renderer.bg_cache.as_ref().unwrap().1);
+        assert_eq!(original.dimensions(), (480, 480));
+        assert_eq!(
+            *original,
+            load_background_image(&config.background).unwrap()
+        );
+        let first = renderer.render(&config, &normal());
+        let second = renderer.render(&config, &make_values(&[("cpu_temp", 99.0)]));
+        assert_ne!(first, second);
+        assert!(Arc::ptr_eq(
+            &original,
+            &renderer.bg_cache.as_ref().unwrap().1
+        ));
+        config.background_cache_compression = crate::config::BackgroundCacheCompression::Lz4Hc9;
         renderer.update_bg_cache(&config);
-        assert_ne!(
-            renderer.bg_geometry_cache.as_ref().unwrap().0,
-            original_geometry.0
+        wait_for_background(&mut renderer, &config);
+        assert_eq!(*renderer.bg_cache.as_ref().unwrap().1, *original);
+        assert!(!Arc::ptr_eq(
+            &original,
+            &renderer.bg_cache.as_ref().unwrap().1
+        ));
+        config.background.pan_x = 40.0;
+        wait_for_background(&mut renderer, &config);
+        assert_ne!(*renderer.bg_cache.as_ref().unwrap().1, *original);
+        assert_eq!(
+            *renderer.bg_cache.as_ref().unwrap().1,
+            load_background_image(&config.background).unwrap()
         );
-        let _ = std::fs::remove_file(path);
+        config.background.background_color = [1, 2, 3];
+        wait_for_background(&mut renderer, &config);
+        assert_eq!(
+            *renderer.bg_cache.as_ref().unwrap().1,
+            load_background_image(&config.background).unwrap()
+        );
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -2337,86 +2148,17 @@ mod tests {
     }
 
     #[test]
-    fn animated_source_advances_frames_from_elapsed_time() {
-        let red = RgbImage::from_pixel(1, 1, Rgb([255, 0, 0]));
-        let blue = RgbImage::from_pixel(1, 1, Rgb([0, 0, 255]));
-        let mut source = AnimatedSource::Gif {
-            frames: vec![
-                (red.clone(), Duration::from_millis(100)),
-                (blue.clone(), Duration::from_millis(100)),
-            ],
-            total: Duration::from_millis(200),
-            started: Instant::now(),
-            current: usize::MAX,
-        };
-
-        assert_eq!(source.next_frame().unwrap(), red);
-        if let AnimatedSource::Gif { started, .. } = &mut source {
-            *started = Instant::now() - Duration::from_millis(150);
-        }
-        assert_eq!(source.next_frame().unwrap(), blue);
-        assert!(source.next_frame().is_none());
-    }
-
-    #[test]
-    fn animated_source_reports_its_frame_cadence() {
-        let gif = AnimatedSource::Gif {
-            frames: vec![(
-                RgbImage::from_pixel(1, 1, Rgb([0, 0, 0])),
-                Duration::from_millis(80),
-            )],
-            total: Duration::from_millis(80),
-            started: Instant::now(),
-            current: 0,
-        };
-        assert_eq!(gif.frame_interval(), Some(Duration::from_millis(80)));
-
-        let still = AnimatedSource::Static {
-            image: RgbImage::new(1, 1),
-            delivered: false,
-        };
-        assert_eq!(still.frame_interval(), None);
-
-        let fast_gif = AnimatedSource::Gif {
-            frames: vec![(
-                RgbImage::from_pixel(1, 1, Rgb([0, 0, 0])),
-                Duration::from_millis(10),
-            )],
-            total: Duration::from_millis(10),
-            started: Instant::now(),
-            current: 0,
-        };
-        assert_eq!(
-            fast_gif.frame_interval(),
-            Some(Duration::from_secs_f64(1.0 / MAX_DEVICE_FRAME_RATE))
-        );
-    }
-
-    #[test]
-    fn static_source_delivers_only_one_cache_invalidation() {
-        let image = RgbImage::from_pixel(1, 1, Rgb([1, 2, 3]));
-        let mut source = AnimatedSource::Static {
-            image: image.clone(),
-            delivered: false,
-        };
-
-        assert_eq!(source.next_frame().unwrap(), image);
-        assert!(source.next_frame().is_none());
-    }
-
-    #[test]
-    fn mjpeg_reader_delivers_decodable_frames() {
-        let source = RgbImage::from_pixel(3, 2, Rgb([20, 40, 60]));
-        let mut encoded = Cursor::new(Vec::new());
-        source
-            .write_to(&mut encoded, image::ImageFormat::Jpeg)
+    fn live_jpeg_uses_decodable_420_sampling() {
+        let bytes = Renderer::new().render(&Config::default(), &normal());
+        let decoded = image::load_from_memory(&bytes).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (W, H));
+        // Baseline SOF: marker, length, precision, dimensions, component count,
+        // then component ID and the luma sampling byte (2x2 for 4:2:0).
+        let sof = bytes
+            .windows(2)
+            .position(|marker| marker == [0xff, 0xc0])
             .unwrap();
-        let (tx, rx) = mpsc::sync_channel(1);
-
-        read_mjpeg_frames(Cursor::new(encoded.into_inner()), tx);
-
-        let decoded = rx.try_recv().unwrap();
-        assert_eq!((decoded.width(), decoded.height()), (3, 2));
+        assert_eq!(bytes[sof + 11], 0x22);
     }
 
     #[test]

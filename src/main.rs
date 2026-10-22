@@ -734,6 +734,7 @@ fn main() -> Result<()> {
     }
     let mut last_sensor_update = Instant::now();
     let mut daemon_is_paused = false;
+    let mut next_frame = Instant::now();
 
     while !shutdown_requested.load(Ordering::SeqCst) {
         if daemon_control.pause_requested() {
@@ -768,6 +769,7 @@ fn main() -> Result<()> {
                     daemon_is_paused = false;
                     daemon_control.mark_running();
                     last_sensor_update = Instant::now() - interval;
+                    next_frame = Instant::now();
                     println!("Device preview pause ended.");
                 }
                 Err(error) => {
@@ -776,8 +778,6 @@ fn main() -> Result<()> {
                 }
             }
         }
-        let tick = Instant::now();
-
         // Reload config if file changed
         let mtime = file_mtime(&config_path);
         if mtime != cfg_mtime {
@@ -808,28 +808,49 @@ fn main() -> Result<()> {
         dev.as_mut().unwrap().send_frame_data(&jpeg)?;
 
         let frame_interval = renderer.animation_frame_interval().unwrap_or(interval);
-        let elapsed = tick.elapsed();
-        if elapsed < frame_interval {
-            let deadline = Instant::now() + (frame_interval - elapsed);
-            while Instant::now() < deadline
-                && !shutdown_requested.load(Ordering::SeqCst)
-                && !daemon_control.pause_requested()
-            {
-                std::thread::sleep(
-                    deadline
-                        .saturating_duration_since(Instant::now())
-                        .min(Duration::from_millis(50)),
-                );
-            }
+        next_frame = next_frame_deadline(next_frame, frame_interval, Instant::now());
+        while Instant::now() < next_frame
+            && !shutdown_requested.load(Ordering::SeqCst)
+            && !daemon_control.pause_requested()
+        {
+            std::thread::sleep(
+                next_frame
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(50)),
+            );
         }
     }
     println!("Graceful shutdown complete.");
     Ok(())
 }
 
+// Keep a monotonic cadence across small render/sleep variations. After an
+// overrun, start a new cadence at the current time rather than catching up.
+fn next_frame_deadline(previous: Instant, period: Duration, now: Instant) -> Instant {
+    (previous + period).max(now)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frame_deadlines_preserve_cadence_and_resync_after_overruns() {
+        let start = Instant::now();
+        let period = Duration::from_millis(40);
+        assert_eq!(
+            next_frame_deadline(start, period, start + Duration::from_millis(12)),
+            start + period,
+        );
+        assert_eq!(
+            next_frame_deadline(start, period, start + Duration::from_millis(95)),
+            start + Duration::from_millis(95),
+        );
+        assert_eq!(
+            next_frame_deadline(start, period, start + period),
+            start + period,
+        );
+    }
 
     #[test]
     fn gui_write_gate_only_accepts_supported_one_shot_operations() {
