@@ -438,7 +438,7 @@ pub fn arc_pointer_angle(
 }
 
 pub struct TimedAnimation {
-    frames: Vec<(RgbImage, Duration)>,
+    frames: Vec<(RgbaImage, Duration)>,
     dimensions: Vec<(u32, u32)>,
     started: Instant,
 }
@@ -460,10 +460,7 @@ impl TimedAnimation {
                     Duration::from_secs_f64(f64::from(numerator) / f64::from(denominator) / 1000.0)
                 }
                 .max(Duration::from_millis(10));
-                (
-                    image::DynamicImage::ImageRgba8(frame.into_buffer()).into_rgb8(),
-                    delay,
-                )
+                (frame.into_buffer(), delay)
             })
             .collect::<Vec<_>>();
         if frames.is_empty() {
@@ -487,7 +484,7 @@ impl TimedAnimation {
         self.frames.len()
     }
 
-    pub fn frame(&self, index: usize) -> Option<&RgbImage> {
+    pub fn frame(&self, index: usize) -> Option<&RgbaImage> {
         self.frames.get(index).map(|(frame, _)| frame)
     }
 
@@ -510,7 +507,7 @@ impl TimedAnimation {
             .unwrap_or(100)
     }
 
-    pub fn current_uniform_frame(&self, start: usize, end: usize, delay_ms: u32) -> &RgbImage {
+    pub fn current_uniform_frame(&self, start: usize, end: usize, delay_ms: u32) -> &RgbaImage {
         let start = start.min(self.frames.len() - 1);
         let end = end.clamp(start, self.frames.len() - 1);
         let count = end - start + 1;
@@ -969,40 +966,19 @@ fn overlay_rgba(canvas: &mut RgbImage, layer: &RgbaImage, left: i64, top: i64) {
 fn load_background_image(config: &BackgroundConfig) -> Option<RgbImage> {
     let path = config.image_path.as_deref()?;
     let source = load_background_source(path)?;
+    let source = flatten_rgba_on_canvas(&source, config.background_color);
     transform_background_image(&source, config)
 }
 
-fn load_background_source(path: &str) -> Option<RgbImage> {
+fn load_background_source(path: &str) -> Option<RgbaImage> {
     image::open(path)
-        .map(|image| image.into_rgb8())
+        .map(|image| image.into_rgba8())
         .ok()
         .or_else(|| load_ffmpeg_first_frame(path))
 }
 
-/// Decode one frame through the optional FFmpeg runtime when image does not
-/// support the selected file. A missing or failing binary simply leaves the
-/// background unchanged; the GUI presents the actionable error at selection.
-fn load_ffmpeg_first_frame(path: &str) -> Option<RgbImage> {
-    let output = Command::new("ffmpeg")
-        .args([
-            "-v",
-            "error",
-            "-i",
-            path,
-            "-frames:v",
-            "1",
-            "-f",
-            "image2pipe",
-            "-vcodec",
-            "png",
-            "pipe:1",
-        ])
-        .output()
-        .ok()?;
-    output.status.success().then_some(())?;
-    image::load_from_memory(&output.stdout)
-        .ok()
-        .map(|image| image.into_rgb8())
+fn load_ffmpeg_first_frame(path: &str) -> Option<RgbaImage> {
+    load_media_frame_at(Path::new(path), 0.0).ok()
 }
 
 pub fn media_duration(path: &Path) -> Result<f64, String> {
@@ -1050,7 +1026,7 @@ pub fn media_duration(path: &Path) -> Result<f64, String> {
         .map_err(|_| "ffprobe returned an invalid duration".to_string())
 }
 
-pub fn load_media_frame_at(path: &Path, seconds: f64) -> Result<RgbImage, String> {
+pub fn load_media_frame_at(path: &Path, seconds: f64) -> Result<RgbaImage, String> {
     let is_gif = path
         .extension()
         .and_then(|extension| extension.to_str())
@@ -1077,13 +1053,19 @@ pub fn load_media_frame_at(path: &Path, seconds: f64) -> Result<RgbImage, String
                 target < elapsed
             })
             .unwrap_or(frames.len() - 1);
-        return Ok(image::DynamicImage::ImageRgba8(frames[index].buffer().clone()).into_rgb8());
+        return Ok(frames[index].buffer().clone());
     }
     if let Ok(image) = image::open(path) {
-        return Ok(image.into_rgb8());
+        return Ok(image.into_rgba8());
     }
-    let output = Command::new("ffmpeg")
-        .args(["-v", "error", "-ss", &seconds.max(0.0).to_string(), "-i"])
+    let decoder = video_alpha_decoder(path)?;
+    let mut command = Command::new("ffmpeg");
+    command.args(["-v", "error", "-ss", &seconds.max(0.0).to_string()]);
+    if let Some(decoder) = decoder {
+        command.args(["-c:v", decoder]);
+    }
+    let output = command
+        .arg("-i")
         .arg(path)
         .args([
             "-frames:v",
@@ -1092,6 +1074,8 @@ pub fn load_media_frame_at(path: &Path, seconds: f64) -> Result<RgbImage, String
             "image2pipe",
             "-vcodec",
             "png",
+            "-pix_fmt",
+            "rgba",
             "pipe:1",
         ])
         .output()
@@ -1100,7 +1084,7 @@ pub fn load_media_frame_at(path: &Path, seconds: f64) -> Result<RgbImage, String
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
     image::load_from_memory(&output.stdout)
-        .map(|image| image.into_rgb8())
+        .map(|image| image.into_rgba8())
         .map_err(|error| error.to_string())
 }
 
@@ -1110,6 +1094,97 @@ fn ffmpeg_start_error(error: std::io::Error) -> String {
     } else {
         format!("failed to start FFmpeg: {error}")
     }
+}
+
+/// Composite straight alpha onto the selected matte before RGB geometry.
+/// Flattening before interpolation prevents hidden transparent RGB from bleeding
+/// into scaled/rotated edges. Cache and USB formats remain opaque RGB/JPEG.
+pub fn flatten_rgba_on_canvas(source: &RgbaImage, color: [u8; 3]) -> RgbImage {
+    RgbImage::from_fn(source.width(), source.height(), |x, y| {
+        let pixel = source.get_pixel(x, y);
+        let alpha = u32::from(pixel[3]);
+        Rgb(std::array::from_fn(|channel| {
+            ((u32::from(pixel[channel]) * alpha + u32::from(color[channel]) * (255 - alpha) + 127)
+                / 255) as u8
+        }))
+    })
+}
+
+pub fn transform_rgba_media_image(source: &RgbaImage, media: &MediaTransform) -> Option<RgbImage> {
+    transform_media_image(&flatten_rgba_on_canvas(source, media.canvas_color), media)
+}
+
+/// WebM alpha is an auxiliary VP8/VP9 bitstream that native FFmpeg decoders
+/// commonly ignore. Select libvpx explicitly when the stream declares alpha.
+fn video_alpha_decoder(path: &Path) -> Result<Option<&'static str>, String> {
+    let container = path
+        .extension()
+        .and_then(|v| v.to_str())
+        .unwrap_or_default();
+    if !container.eq_ignore_ascii_case("webm") && !container.eq_ignore_ascii_case("mkv") {
+        return Ok(None);
+    }
+    let probe = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=codec_name:stream_tags=alpha_mode",
+            "-of",
+            "default=noprint_wrappers=1",
+        ])
+        .arg(path)
+        .output()
+        .map_err(|error| {
+            format!("Inspecting WebM/Matroska transparency requires ffprobe: {error}")
+        })?;
+    if !probe.status.success() {
+        return Err("Cannot inspect video transparency with ffprobe".into());
+    }
+    let metadata = String::from_utf8_lossy(&probe.stdout);
+    let mut codec = "";
+    let mut alpha = false;
+    for line in metadata.lines() {
+        if let Some((key, value)) = line.split_once('=') {
+            if key == "codec_name" {
+                codec = value;
+            }
+            if key.eq_ignore_ascii_case("TAG:alpha_mode") && value == "1" {
+                alpha = true;
+            }
+        }
+    }
+    let decoder = match (alpha, codec) {
+        (true, "vp9") => "libvpx-vp9",
+        (true, "vp8") => "libvpx",
+        _ => return Ok(None),
+    };
+    let decoders = Command::new("ffmpeg")
+        .args(["-hide_banner", "-decoders"])
+        .output()
+        .map_err(ffmpeg_start_error)?;
+    if !decoders.status.success()
+        || !String::from_utf8_lossy(&decoders.stdout)
+            .lines()
+            .any(|line| line.split_whitespace().nth(1) == Some(decoder))
+    {
+        return Err(format!(
+            "Transparent {codec} video requires an FFmpeg build with the {decoder} decoder"
+        ));
+    }
+    Ok(Some(decoder))
+}
+
+/// Flatten video frames before the MJPEG transport removes their alpha.
+fn video_matte_filter(color: [u8; 3]) -> String {
+    let [r, g, b] = color;
+    format!(
+        "[0:v]fps={MAX_DEVICE_FRAME_RATE},format=rgba,split=2[fg][matte];\
+        [matte]drawbox=x=0:y=0:w=iw:h=ih:t=fill:color=0x{r:02x}{g:02x}{b:02x}@1:replace=1[bg];\
+        [bg][fg]overlay=shortest=1:alpha=straight:format=rgb[out]"
+    )
 }
 
 /// Transform one decoded frame into the 480x480 background canvas.
@@ -1356,6 +1431,52 @@ mod tests {
     }
 
     // ── render_preview ────────────────────────────────────────────────────────
+
+    #[test]
+    fn alpha_is_flattened_on_canvas_with_partial_and_opaque_pixels_preserved() {
+        let mut source = RgbaImage::new(3, 1);
+        source.put_pixel(0, 0, Rgba([255, 99, 77, 0]));
+        source.put_pixel(1, 0, Rgba([255, 0, 0, 128]));
+        source.put_pixel(2, 0, Rgba([12, 34, 56, 255]));
+        let rgb = flatten_rgba_on_canvas(&source, [0, 0, 255]);
+        assert_eq!(rgb.get_pixel(0, 0), &Rgb([0, 0, 255]));
+        assert_eq!(rgb.get_pixel(1, 0), &Rgb([128, 0, 127]));
+        assert_eq!(rgb.get_pixel(2, 0), &Rgb([12, 34, 56]));
+    }
+
+    #[test]
+    fn transparent_hidden_colors_do_not_bleed_during_scaling_or_rotation() {
+        let source = RgbaImage::from_fn(7, 5, |x, _| {
+            Rgba([255, 0, if x % 2 == 0 { 255 } else { 0 }, 0])
+        });
+        let mut media = MediaTransform {
+            canvas_color: [0, 200, 0],
+            fit: ImageFit::Contain,
+            ..Default::default()
+        };
+        media.transform.rotation = 37.0;
+        media.transform.zoom = 1.2;
+        media.transform.pan_x = 13.0;
+        let rendered = transform_rgba_media_image(&source, &media).unwrap();
+        assert!(rendered
+            .pixels()
+            .all(|pixel| pixel[0] == 0 && pixel[2] == 0 && pixel[1].abs_diff(200) <= 1));
+    }
+
+    #[test]
+    fn retained_rgba_media_can_change_canvas_color_without_redecoding() {
+        let source = RgbaImage::from_pixel(16, 8, Rgba([255, 0, 0, 0]));
+        let mut media = MediaTransform {
+            canvas_color: [17, 61, 113],
+            ..Default::default()
+        };
+        let first = transform_rgba_media_image(&source, &media).unwrap();
+        assert_eq!(first.get_pixel(240, 240), &Rgb([17, 61, 113]));
+        media.canvas_color = [0, 200, 0];
+        let second = transform_rgba_media_image(&source, &media).unwrap();
+        assert_eq!(second.get_pixel(240, 240), &Rgb([0, 200, 0]));
+        assert_eq!(source.get_pixel(0, 0), &Rgba([255, 0, 0, 0]));
+    }
 
     #[test]
     fn render_normal_values_produces_480x480() {
@@ -2192,7 +2313,7 @@ mod tests {
         assert!((media_duration(&path).unwrap() - 0.2).abs() < 0.001);
         assert_eq!(
             load_media_frame_at(&path, 0.15).unwrap().get_pixel(0, 0),
-            &Rgb([0, 0, 255])
+            &Rgba([0, 0, 255, 255])
         );
         let _ = std::fs::remove_file(path);
     }

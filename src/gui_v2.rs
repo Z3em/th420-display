@@ -22,8 +22,8 @@ use instance::{
 use profile::ProfileStore;
 use renderer::{
     arc_pointer_angle, centered_grid_coordinates, load_media_frame_at, media_duration,
-    transform_media_image, DragSnapState, MediaFootprint, PanRegion, Renderer, RotationDragState,
-    TimedAnimation,
+    transform_rgba_media_image as transform_media_image, DragSnapState, MediaFootprint, PanRegion,
+    Renderer, RotationDragState, TimedAnimation,
 };
 use sensors::SensorValues;
 use service_manager::ServiceManager;
@@ -242,7 +242,7 @@ struct StandbyFrameKey {
 
 enum StandbyWorkerResult {
     Metadata(PathBuf, Result<f64, String>),
-    Frame(StandbyFrameKey, Result<image::RgbImage, String>),
+    Frame(StandbyFrameKey, Result<image::RgbaImage, String>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -331,7 +331,7 @@ struct App {
     brightness: u8,
     boot_path: Option<PathBuf>,
     standby_path: Option<PathBuf>,
-    boot_source_cache: Option<(PathBuf, image::RgbImage)>,
+    boot_source_cache: Option<(PathBuf, image::RgbaImage)>,
     boot_animation: Option<(PathBuf, TimedAnimation)>,
     boot_animation_pending: Option<PathBuf>,
     boot_animation_tx: Sender<(PathBuf, Result<TimedAnimation, String>)>,
@@ -341,7 +341,7 @@ struct App {
     boot_scrub_frame: usize,
     boot_preview_playing: bool,
     boot_frame_delay_ms: u32,
-    standby_source_cache: Option<(PathBuf, u64, image::RgbImage)>,
+    standby_source_cache: Option<(PathBuf, u64, image::RgbaImage)>,
     standby_time: f64,
     standby_duration: Option<f64>,
     standby_metadata_path: Option<PathBuf>,
@@ -6413,13 +6413,13 @@ fn file_name(path: Option<&PathBuf>) -> String {
         .to_string()
 }
 
-fn load_media_source_frame(path: &Path) -> Option<image::RgbImage> {
+fn load_media_source_frame(path: &Path) -> Option<image::RgbaImage> {
     Some(if is_gif(path) {
         let decoder = GifDecoder::new(BufReader::new(File::open(path).ok()?)).ok()?;
         let frame = decoder.into_frames().next()?.ok()?;
-        image::DynamicImage::ImageRgba8(frame.into_buffer()).into_rgb8()
+        frame.into_buffer()
     } else {
-        image::open(path).ok()?.into_rgb8()
+        image::open(path).ok()?.into_rgba8()
     })
 }
 

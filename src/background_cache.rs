@@ -423,6 +423,11 @@ fn prepare(request: &Request, shared: &Shared, budget: usize) -> Result<(), Stri
         .and_then(|v| v.to_str())
         .is_some_and(|v| v.eq_ignore_ascii_case("gif"));
     let animated = gif || image::image_dimensions(path).is_err();
+    let alpha_decoder = if animated && !gif {
+        super::video_alpha_decoder(path)?
+    } else {
+        None
+    };
     let mut output = Accumulator {
         request,
         shared,
@@ -451,25 +456,38 @@ fn prepare(request: &Request, shared: &Shared, budget: usize) -> Result<(), Stri
                     Duration::from_secs_f64(f64::from(n) / f64::from(d) / 1000.0)
                 }
                 .max(Duration::from_millis(10));
-                let image = image::DynamicImage::ImageRgba8(frame.into_buffer()).into_rgb8();
+                let image = super::flatten_rgba_on_canvas(
+                    &frame.into_buffer(),
+                    request.key.background.background_color,
+                );
                 if !output.emit(image, delay)? {
                     return Ok(());
                 }
             }
         } else if !animated {
-            let image = image::open(path).map_err(|e| e.to_string())?.into_rgb8();
+            let image = super::flatten_rgba_on_canvas(
+                &image::open(path).map_err(|e| e.to_string())?.into_rgba8(),
+                request.key.background.background_color,
+            );
             if !output.emit(image, video_period())? {
                 return Ok(());
             }
         } else {
-            let filter = format!("fps={MAX_DEVICE_FRAME_RATE}");
-            let mut child = Command::new("ffmpeg")
-                .args(["-v", "error", "-i"])
+            let filter = super::video_matte_filter(request.key.background.background_color);
+            let mut command = Command::new("ffmpeg");
+            command.args(["-v", "error"]);
+            if let Some(decoder) = alpha_decoder {
+                command.args(["-c:v", decoder]);
+            }
+            let mut child = command
+                .arg("-i")
                 .arg(path)
                 .args([
                     "-an",
-                    "-vf",
+                    "-filter_complex",
                     &filter,
+                    "-map",
+                    "[out]",
                     "-f",
                     "image2pipe",
                     "-vcodec",
@@ -598,6 +616,139 @@ mod tests {
             assert!(player.error.is_none(), "{:?}", player.error);
             assert!(Instant::now() < until, "preparation timed out");
             std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    fn png_and_gif_transparency_use_canvas_in_raw_and_compressed_caches() {
+        for extension in ["png", "gif"] {
+            let path = path(&format!("alpha.{extension}"));
+            let rgba = RgbaImage::from_pixel(16, 8, Rgba([255, 0, 0, 0]));
+            if extension == "gif" {
+                image::codecs::gif::GifEncoder::new(File::create(&path).unwrap())
+                    .encode_frame(GifFrame::from_parts(
+                        rgba,
+                        0,
+                        0,
+                        Delay::from_numer_denom_ms(100, 1),
+                    ))
+                    .unwrap();
+            } else {
+                rgba.save(&path).unwrap();
+            }
+            for compression in [
+                BackgroundCacheCompression::Raw,
+                BackgroundCacheCompression::Lz4Hc9,
+            ] {
+                let mut cfg = config(&path);
+                cfg.background_color = [17, 61, 113];
+                let mut player = BackgroundPlayer::new();
+                player.request(Key::new(&cfg).with_compression(compression));
+                let first = wait(&mut player);
+                assert_eq!(first.get_pixel(240, 240).0, cfg.background_color);
+                cfg.background_color = [0, 200, 0];
+                player.request(Key::new(&cfg).with_compression(compression));
+                let second = wait(&mut player);
+                assert_eq!(second.get_pixel(240, 240).0, cfg.background_color);
+                assert_eq!(second.dimensions(), (W, H));
+                assert_eq!(player.dimensions, Some((16, 8)));
+            }
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    #[ignore = "requires FFmpeg and ffprobe; no device access"]
+    fn transparent_video_ffmpeg_paths_keep_alpha_and_matte_before_mjpeg() {
+        use std::io::Write;
+        let sources = [[255, 0, 0, 0], [255, 0, 0, 128], [255, 0, 0, 255]];
+        for (extension, encoder, options) in [
+            ("mkv", "ffv1", vec!["-pix_fmt", "bgra"]),
+            (
+                "webm",
+                "libvpx-vp9",
+                vec![
+                    "-pix_fmt",
+                    "yuva420p",
+                    "-lossless",
+                    "1",
+                    "-auto-alt-ref",
+                    "0",
+                ],
+            ),
+        ] {
+            let path = path(&format!("alpha-video.{extension}"));
+            let mut encode = Command::new("ffmpeg")
+                .args([
+                    "-v",
+                    "error",
+                    "-y",
+                    "-f",
+                    "rawvideo",
+                    "-pixel_format",
+                    "rgba",
+                    "-video_size",
+                    "16x16",
+                    "-framerate",
+                    "24",
+                    "-i",
+                    "pipe:0",
+                    "-c:v",
+                    encoder,
+                ])
+                .args(&options)
+                .arg(&path)
+                .stdin(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut raw = Vec::new();
+            for pixel in sources {
+                for _ in 0..16 * 16 {
+                    raw.extend_from_slice(&pixel);
+                }
+            }
+            encode.stdin.take().unwrap().write_all(&raw).unwrap();
+            let result = encode.wait_with_output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            if extension == "webm" {
+                assert_eq!(
+                    super::super::video_alpha_decoder(&path).unwrap(),
+                    Some("libvpx-vp9")
+                );
+            }
+            let extracted = super::super::load_media_frame_at(&path, 0.0).unwrap();
+            assert_eq!(extracted.get_pixel(0, 0)[3], 0);
+            let mut cfg = config(&path);
+            cfg.background_color = [0, 0, 255];
+            let mut player = BackgroundPlayer::new();
+            player.request(Key::new(&cfg).with_compression(BackgroundCacheCompression::Lz4Hc9));
+            wait(&mut player);
+            let cached = player.cached.as_ref().unwrap();
+            assert_eq!(cached.frames.len(), 3);
+            for (frame, source) in cached.frames.iter().zip(sources) {
+                let expected = super::super::flatten_rgba_on_canvas(
+                    &RgbaImage::from_pixel(1, 1, Rgba(source)),
+                    cfg.background_color,
+                );
+                let decoded = frame.pixels.decode(&mut None).unwrap();
+                for channel in 0..3 {
+                    assert!(
+                        decoded.get_pixel(240, 240)[channel]
+                            .abs_diff(expected.get_pixel(0, 0)[channel])
+                            <= 4,
+                        "{extension}: alpha={} got={:?} expected={:?}",
+                        source[3],
+                        decoded.get_pixel(240, 240),
+                        expected.get_pixel(0, 0)
+                    );
+                }
+            }
+            std::fs::remove_file(path).unwrap();
         }
     }
 

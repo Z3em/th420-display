@@ -137,6 +137,14 @@ instance; queue/current-frame buffers, codec buffers, and decoder/transformation
 working memory are additional. Native-resolution frames and finished JPEGs are
 not retained in the playback cache.
 
+Transparent and semi-transparent media pixels are blended onto **Canvas color**
+before scaling, rotation, caching, and JPEG encoding. This applies to Live
+Display, Boot, and Standby; their previews retain alpha so changing Canvas color
+also updates transparent areas. The live cache still stores only opaque RGB
+backgrounds. Video transparency requires decoder support in FFmpeg. VP8/VP9
+WebM alpha is detected with ffprobe and decoded with libvpx/libvpx-vp9; the app
+reports an error if the required alpha-capable decoder is unavailable.
+
 Changes to the source file, background settings, compression mode, or cache
 size rebuild the cache; sensor updates do not. GIF delays are preserved, and video output is
 normalized to 24 FPS. The previous prepared background stays visible while a

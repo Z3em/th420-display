@@ -235,7 +235,7 @@ fn media_transform(cli: &Cli) -> Result<MediaTransform> {
 
 fn encode_jpeg(path: &Path, transform: &MediaTransform, media_time: f64) -> Result<Vec<u8>> {
     let source = renderer::load_media_frame_at(path, media_time).map_err(anyhow::Error::msg)?;
-    let transformed = renderer::transform_media_image(&source, transform)
+    let transformed = renderer::transform_rgba_media_image(&source, transform)
         .ok_or_else(|| anyhow::anyhow!("media frame is empty"))?;
     encode_rgb_jpeg(transformed)
 }
@@ -264,8 +264,8 @@ fn decode_gif(
             } else {
                 Duration::from_secs_f64(f64::from(numerator) / f64::from(denominator) / 1000.0)
             };
-            let rgb = image::DynamicImage::ImageRgba8(frame.into_buffer()).into_rgb8();
-            let transformed = renderer::transform_media_image(&rgb, transform)
+            let rgba = frame.into_buffer();
+            let transformed = renderer::transform_rgba_media_image(&rgba, transform)
                 .ok_or_else(|| anyhow::anyhow!("media frame is empty"))?;
             Ok((encode_rgb_jpeg(transformed)?, delay))
         })
@@ -345,8 +345,8 @@ fn decode_boot_gif(
             source_delay_ms = Some(delay_ms);
         }
 
-        let rgb = image::DynamicImage::ImageRgba8(frame.into_buffer()).into_rgb8();
-        let transformed = renderer::transform_media_image(&rgb, transform)
+        let rgba = frame.into_buffer();
+        let transformed = renderer::transform_rgba_media_image(&rgba, transform)
             .ok_or_else(|| anyhow::anyhow!("boot frame is empty"))?;
         frames.push(encode_boot_jpeg(transformed)?);
     }
@@ -1054,6 +1054,40 @@ mod tests {
             }
         )
         .is_err());
+    }
+
+    #[test]
+    fn transparent_boot_and_live_gif_use_the_selected_media_canvas() {
+        let path = std::env::temp_dir().join(format!(
+            "th420-alpha-boot-{}-{:?}.gif",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        image::codecs::gif::GifEncoder::new(File::create(&path).unwrap())
+            .encode_frame(image::Frame::from_parts(
+                image::RgbaImage::from_pixel(16, 8, image::Rgba([255, 0, 0, 0])),
+                0,
+                0,
+                image::Delay::from_numer_denom_ms(100, 1),
+            ))
+            .unwrap();
+        let media = MediaTransform {
+            canvas_color: [0, 200, 0],
+            ..Default::default()
+        };
+        let edit = BootEdit {
+            start_frame: 0,
+            end_frame: None,
+            frame_delay_ms: None,
+        };
+        let live = decode_gif(&path, &media, edit).unwrap();
+        let boot = decode_boot_gif(&path, &media, edit).unwrap();
+        for jpeg in [&live[0].0, &boot.0[0]] {
+            let rgb = image::load_from_memory(jpeg).unwrap().into_rgb8();
+            let pixel = rgb.get_pixel(240, 240);
+            assert!(pixel[0] <= 3 && pixel[1].abs_diff(200) <= 3 && pixel[2] <= 3);
+        }
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
